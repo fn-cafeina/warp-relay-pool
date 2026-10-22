@@ -3,8 +3,11 @@
 # Topology: bridge 10.244.0.0/16, relay app fixed at 10.244.0.100.
 # warp-N raw SOCKS5 proxy on 127.0.0.1:<10800+N> (override bind: WARP_BIND),
 # relay router (mesh-VPN ingress) on 127.0.0.1:3101-3110 (override bind: INGRESS_BIND).
-# Relay app env (RELAY_COUNT, BASE_PORT, RELAY_ALLOWED_TARGETS) is baked from
-# the generation-time environment / .env — regenerate after editing either.
+# Relay app env (RELAY_COUNT, BASE_PORT, RELAY_ALLOWED_TARGETS, LIVE_SIGNALS,
+# LIVE_SIGNAL_FILE) is baked from the generation-time environment / .env —
+# regenerate after editing either.
+# The relay app bind-mounts ./.keep-cold at /signals so its 429 signal file
+# lands in the same directory the host keep-cold reads (LIVE_SIGNALS=1).
 networks:
   default:
     ipam:
@@ -19,7 +22,6 @@ services:
     restart: always
     cap_add:
       - NET_ADMIN
-      - SYS_MODULE
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
       - net.ipv6.conf.all.disable_ipv6=0
@@ -30,6 +32,11 @@ services:
       - warp-data-1:/etc/wireguard
     mem_limit: 32M
     mem_reservation: 8M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "127.0.0.1:10801:1080"
 
@@ -40,7 +47,6 @@ services:
     restart: always
     cap_add:
       - NET_ADMIN
-      - SYS_MODULE
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
       - net.ipv6.conf.all.disable_ipv6=0
@@ -51,6 +57,11 @@ services:
       - warp-data-2:/etc/wireguard
     mem_limit: 32M
     mem_reservation: 8M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "127.0.0.1:10802:1080"
 
@@ -61,7 +72,6 @@ services:
     restart: always
     cap_add:
       - NET_ADMIN
-      - SYS_MODULE
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
       - net.ipv6.conf.all.disable_ipv6=0
@@ -72,6 +82,11 @@ services:
       - warp-data-3:/etc/wireguard
     mem_limit: 32M
     mem_reservation: 8M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "127.0.0.1:10803:1080"
 
@@ -82,7 +97,6 @@ services:
     restart: always
     cap_add:
       - NET_ADMIN
-      - SYS_MODULE
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
       - net.ipv6.conf.all.disable_ipv6=0
@@ -93,6 +107,11 @@ services:
       - warp-data-4:/etc/wireguard
     mem_limit: 32M
     mem_reservation: 8M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "127.0.0.1:10804:1080"
 
@@ -103,7 +122,6 @@ services:
     restart: always
     cap_add:
       - NET_ADMIN
-      - SYS_MODULE
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
       - net.ipv6.conf.all.disable_ipv6=0
@@ -114,6 +132,11 @@ services:
       - warp-data-5:/etc/wireguard
     mem_limit: 32M
     mem_reservation: 8M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "127.0.0.1:10805:1080"
 
@@ -124,7 +147,6 @@ services:
     restart: always
     cap_add:
       - NET_ADMIN
-      - SYS_MODULE
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
       - net.ipv6.conf.all.disable_ipv6=0
@@ -135,6 +157,11 @@ services:
       - warp-data-6:/etc/wireguard
     mem_limit: 32M
     mem_reservation: 8M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "127.0.0.1:10806:1080"
 
@@ -145,7 +172,6 @@ services:
     restart: always
     cap_add:
       - NET_ADMIN
-      - SYS_MODULE
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
       - net.ipv6.conf.all.disable_ipv6=0
@@ -156,6 +182,11 @@ services:
       - warp-data-7:/etc/wireguard
     mem_limit: 32M
     mem_reservation: 8M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "127.0.0.1:10807:1080"
 
@@ -166,7 +197,6 @@ services:
     restart: always
     cap_add:
       - NET_ADMIN
-      - SYS_MODULE
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
       - net.ipv6.conf.all.disable_ipv6=0
@@ -177,6 +207,11 @@ services:
       - warp-data-8:/etc/wireguard
     mem_limit: 32M
     mem_reservation: 8M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "127.0.0.1:10808:1080"
 
@@ -187,7 +222,6 @@ services:
     restart: always
     cap_add:
       - NET_ADMIN
-      - SYS_MODULE
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
       - net.ipv6.conf.all.disable_ipv6=0
@@ -198,6 +232,11 @@ services:
       - warp-data-9:/etc/wireguard
     mem_limit: 32M
     mem_reservation: 8M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "127.0.0.1:10809:1080"
 
@@ -208,7 +247,6 @@ services:
     restart: always
     cap_add:
       - NET_ADMIN
-      - SYS_MODULE
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
       - net.ipv6.conf.all.disable_ipv6=0
@@ -219,6 +257,11 @@ services:
       - warp-data-10:/etc/wireguard
     mem_limit: 32M
     mem_reservation: 8M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "127.0.0.1:10810:1080"
 
@@ -226,10 +269,19 @@ services:
     build: .
     container_name: warp-relay-app
     restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       - RELAY_COUNT=10
       - BASE_PORT=3000
       - RELAY_ALLOWED_TARGETS=https://opencode.ai,https://api.kilo.ai
+      - LIVE_SIGNALS=0
+      - LIVE_SIGNAL_FILE=/signals/signals.json
+    volumes:
+      - ./.keep-cold:/signals
     networks:
       default:
         ipv4_address: 10.244.0.100

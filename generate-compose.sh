@@ -74,6 +74,16 @@ fi
 if [ "$WITH_TUNNELS" = true ]; then TUNNEL_FLAG=" --with-tunnels"; else TUNNEL_FLAG=""; fi
 
 BASE_PORT="${BASE_PORT:-3000}"
+case "$BASE_PORT" in
+  ''|*[!0-9]*)
+    echo "error: BASE_PORT must be an integer 1..65535, got '$BASE_PORT'" >&2
+    exit 1
+    ;;
+esac
+if [ "$BASE_PORT" -lt 1 ] || [ $((BASE_PORT + COUNT)) -gt 65535 ]; then
+  echo "error: BASE_PORT+COUNT must be <= 65535, got $((BASE_PORT + COUNT))" >&2
+  exit 1
+fi
 HOST_LO=$((3100 + 1))
 HOST_HI=$((3100 + COUNT))
 CONT_LO=$((BASE_PORT + 1))
@@ -89,8 +99,8 @@ ROUTER_BIND="${INGRESS_BIND:-127.0.0.1}"
 # which the templates below do not emit — reject rather than write a file
 # Docker cannot parse.
 case "$SOCKS_BIND$ROUTER_BIND" in
-  *:*)
-    echo "error: WARP_BIND/INGRESS_BIND must be IPv4 or 0.0.0.0 (IPv6 binds are not supported); got WARP_BIND='$SOCKS_BIND' INGRESS_BIND='$ROUTER_BIND'" >&2
+  ''|*[!0-9.]*)
+    echo "error: WARP_BIND/INGRESS_BIND must be an IPv4 address; got WARP_BIND='$SOCKS_BIND' INGRESS_BIND='$ROUTER_BIND'" >&2
     exit 1
     ;;
 esac
@@ -107,8 +117,11 @@ cat <<HEADER
 # Topology: bridge 10.244.0.0/16, relay app fixed at 10.244.0.100.
 # warp-N raw SOCKS5 proxy on ${SOCKS_BIND}:<10800+N> (override bind: WARP_BIND),
 # ${ROUTER_LINE}.
-# Relay app env (RELAY_COUNT, BASE_PORT, RELAY_ALLOWED_TARGETS) is baked from
-# the generation-time environment / .env — regenerate after editing either.
+# Relay app env (RELAY_COUNT, BASE_PORT, RELAY_ALLOWED_TARGETS, LIVE_SIGNALS,
+# LIVE_SIGNAL_FILE) is baked from the generation-time environment / .env —
+# regenerate after editing either.
+# The relay app bind-mounts ./.keep-cold at /signals so its 429 signal file
+# lands in the same directory the host keep-cold reads (LIVE_SIGNALS=1).
 networks:
   default:
     ipam:
@@ -130,7 +143,6 @@ cat <<ENTRY
     restart: always
     cap_add:
       - NET_ADMIN
-      - SYS_MODULE
     sysctls:
       - net.ipv4.conf.all.src_valid_mark=1
       - net.ipv6.conf.all.disable_ipv6=0
@@ -141,6 +153,11 @@ cat <<ENTRY
       - warp-data-${i}:/etc/wireguard
     mem_limit: 32M
     mem_reservation: 8M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "${SOCKS_BIND}:${WARP_PORT}:1080"
 
@@ -160,6 +177,11 @@ cat <<ENTRY
       - NET_ADMIN
     sysctls:
       - net.ipv6.conf.all.disable_ipv6=0
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     ports:
       - "${SOCKS_BIND}:${WARP_PORT}:1080"
 
@@ -174,10 +196,19 @@ cat <<ENTRY
     build: .
     container_name: warp-relay-app
     restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       - RELAY_COUNT=${COUNT}
       - BASE_PORT=${BASE_PORT:-3000}
       - RELAY_ALLOWED_TARGETS=${RELAY_ALLOWED_TARGETS:-https://opencode.ai,https://api.kilo.ai}
+      - LIVE_SIGNALS=${LIVE_SIGNALS:-0}
+      - LIVE_SIGNAL_FILE=${LIVE_SIGNAL_FILE:-/signals/signals.json}
+    volumes:
+      - ./.keep-cold:/signals
     networks:
       default:
         ipv4_address: 10.244.0.100
@@ -189,10 +220,19 @@ cat <<ENTRY
     build: .
     container_name: warp-relay-app
     restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     environment:
       - RELAY_COUNT=${COUNT}
       - BASE_PORT=${BASE_PORT:-3000}
       - RELAY_ALLOWED_TARGETS=${RELAY_ALLOWED_TARGETS:-https://opencode.ai,https://api.kilo.ai}
+      - LIVE_SIGNALS=${LIVE_SIGNALS:-0}
+      - LIVE_SIGNAL_FILE=${LIVE_SIGNAL_FILE:-/signals/signals.json}
+    volumes:
+      - ./.keep-cold:/signals
     networks:
       default:
         ipv4_address: 10.244.0.100
@@ -222,6 +262,11 @@ cat <<ENTRY
     image: cloudflare/cloudflared:latest
     container_name: warp-relay-tunnel-${i}
     restart: always
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     command: tunnel --no-autoupdate --url http://10.244.0.100:${PORT}
 
 ENTRY
