@@ -17,7 +17,7 @@ const HEADER_PATH = "x-relay-path";
 // keep-cold's probes carry this: they must never appear as live-traffic
 // signals, or a probe's own 429 would be replayed to the next pass.
 const HEADER_PROBE = "x-keep-cold-probe";
-const DEFAULT_ALLOWED_TARGETS = "https://opencode.ai,https://api.kilo.ai";
+const DEFAULT_ALLOWED_TARGETS = "https://opencode.ai,https://api.kilo.ai,https://oai.endpoints.kepler.ai.cloud.ovh.net";
 const ALLOWED_TARGETS = (process.env.RELAY_ALLOWED_TARGETS ?? DEFAULT_ALLOWED_TARGETS)
   .split(",")
   .map((s) => s.trim().replace(/\/$/, ""))

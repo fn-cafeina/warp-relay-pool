@@ -204,7 +204,7 @@ cat <<ENTRY
     environment:
       - RELAY_COUNT=${COUNT}
       - BASE_PORT=${BASE_PORT:-3000}
-      - RELAY_ALLOWED_TARGETS=${RELAY_ALLOWED_TARGETS:-https://opencode.ai,https://api.kilo.ai}
+      - RELAY_ALLOWED_TARGETS=${RELAY_ALLOWED_TARGETS:-https://opencode.ai,https://api.kilo.ai,https://oai.endpoints.kepler.ai.cloud.ovh.net}
       - LIVE_SIGNALS=${LIVE_SIGNALS:-0}
       - LIVE_SIGNAL_FILE=${LIVE_SIGNAL_FILE:-/signals/signals.json}
     volumes:
@@ -228,7 +228,7 @@ cat <<ENTRY
     environment:
       - RELAY_COUNT=${COUNT}
       - BASE_PORT=${BASE_PORT:-3000}
-      - RELAY_ALLOWED_TARGETS=${RELAY_ALLOWED_TARGETS:-https://opencode.ai,https://api.kilo.ai}
+      - RELAY_ALLOWED_TARGETS=${RELAY_ALLOWED_TARGETS:-https://opencode.ai,https://api.kilo.ai,https://oai.endpoints.kepler.ai.cloud.ovh.net}
       - LIVE_SIGNALS=${LIVE_SIGNALS:-0}
       - LIVE_SIGNAL_FILE=${LIVE_SIGNAL_FILE:-/signals/signals.json}
     volumes:
