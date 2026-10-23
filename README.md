@@ -50,8 +50,10 @@ Or run non-interactively with auto-detected sizing recommendations:
 ## Sizing: Why 5 Relays is the Sweet Spot
 
 For most users and developers running parallel coding subagents, **5 relays** is optimal:
-- **5 Egress Paths:** Upstream rate limits (HTTP 429) are tracked per-IP per-model. Each WARP
-  client gets its own IPv6 `/128`, so IPv6-capable upstreams see five isolated addresses.
+- **5 Egress Paths:** Upstream rate limits (HTTP 429) are tracked per-model per-egress `/64` block.
+  The keep-cold controller automatically verifies that rotations acquire a fresh `/64` prefix
+  block, escalating from soft restarts (zero Cloudflare registrations) to full re-keys only when
+  the address block fails to change.
   IPv4-only upstreams see Cloudflare's shared CGNAT pool, which is why the prober rotates on
   batches and the status table flags duplicate egress IPs.
 - **Ultra-Low Memory Consumption:**

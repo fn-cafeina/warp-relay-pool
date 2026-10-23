@@ -25,7 +25,7 @@ const PORT_MAX = 25999;
 const PORT_BLOCK = 32;
 // Behaviour scenarios that bind relays: keep this in step with the tests below
 // so the random start always leaves room for every block.
-const SCENARIO_BLOCKS = 16;
+const SCENARIO_BLOCKS = 36;
 let nextBlock = PORT_MIN
  + Math.floor(Math.random() * (PORT_MAX - PORT_MIN + 1 - PORT_BLOCK * SCENARIO_BLOCKS));
 
@@ -45,7 +45,47 @@ function newScenario({ count, throttle = {} }) {
  const fakeDocker = path.join(dir, "fake-docker.mjs");
  fs.writeFileSync(
   fakeDocker,
-  'import fs from "node:fs";\nfs.appendFileSync(process.env.FAKE_DOCKER_LOG, process.argv.slice(2).join(" ") + "\\n");\n',
+  `import fs from "node:fs";
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.FAKE_DOCKER_LOG, args.join(" ") + "\\n");
+
+const restartStateFile = (process.env.FAKE_DOCKER_LOG || "") + ".restarts.json";
+function getRestarts() {
+  try { return JSON.parse(fs.readFileSync(restartStateFile, "utf8")); } catch { return {}; }
+}
+function recordRestart(c) {
+  const s = getRestarts();
+  s[c] = (s[c] || 0) + 1;
+  fs.writeFileSync(restartStateFile, JSON.stringify(s));
+}
+
+if (args[0] === "restart") {
+  recordRestart(args[1]);
+} else if (args[0] === "exec") {
+  const container = args[1];
+  const subcmd = args[2];
+  if (subcmd === "test" && args[3] === "-f" && args[4] === "/etc/wireguard/wg0.conf") {
+    const missing = (process.env.FAKE_DOCKER_MISSING_WG0 || "").split(",").filter(Boolean);
+    if (missing.includes(container)) {
+      process.exit(1);
+    }
+    process.exit(0);
+  } else if (subcmd === "curl") {
+    const restarts = getRestarts()[container] || 0;
+    const sticky = Number(process.env.FAKE_DOCKER_STICKY_RESTARTS || 0);
+    const prefixSticky = Number(process.env.FAKE_DOCKER_PREFIX_STICKY || 0);
+    const effective = restarts > sticky ? restarts : 0;
+    const idx = container.replace(/^.*?-/, "");
+    const stuckBlock = prefixSticky > 0 && restarts <= prefixSticky;
+    let ip;
+    if (effective === 0) ip = \`2a09:1:0::\${idx}\`;
+    else if (stuckBlock) ip = \`2a09:1:0::\${effective}\${idx}\`;
+    else ip = \`2a09:2:\${effective}:0::\${idx}\`;
+    process.stdout.write(\`ip=\${ip}\\nwarp=on\\n\`);
+    process.exit(0);
+  }
+}
+`,
  );
  const throttles = new Map();
  for (let i = 1; i <= count; i++) throttles.set(i, new Map());
@@ -78,7 +118,8 @@ function startRelay(port, logFile, throttle) {
      model = "";
     }
     fs.appendFileSync(logFile, `${JSON.stringify({ model })}\n`);
-    const spec = throttle.get(model);
+    const rawSpec = throttle.get(model);
+    const spec = typeof rawSpec === "function" ? rawSpec() : rawSpec;
     if (spec) {
      const headers = { "content-type": "application/json" };
      if (spec.retryAfter !== undefined) headers["retry-after"] = String(spec.retryAfter);
@@ -125,9 +166,13 @@ function baseEnv(sc) {
 
 function runOnce(sc, env = {}, args = ["--once"]) {
  return new Promise((resolve, reject) => {
+  const combinedEnv = { ...process.env, ...baseEnv(sc), ...env };
+  for (const [k, v] of Object.entries(env)) {
+   if (v === undefined || v === null) delete combinedEnv[k];
+  }
   const child = spawn(process.execPath, ["keep-cold.mjs", ...args], {
    cwd: REPO_ROOT,
-   env: { ...process.env, ...baseEnv(sc), ...env },
+   env: combinedEnv,
   });
   let stdout = "";
   let stderr = "";
@@ -514,4 +559,347 @@ test("--once exits 0 on a clean pool and 1 on a held one", async () => {
  const bad = await runOnce(held);
  assert.equal(bad.code, 1, bad.stdout + bad.stderr);
  assert.match(bad.stdout, /pool is not cold: 1 relay\(s\) held or throttled/);
+});
+
+// ── case 11: --fresh-ip-sweep contract ──────────────────────────────
+test("--fresh-ip-sweep succeeds when at least one relay clears on the target model", async () => {
+ const sc = newScenario({ count: 2, throttle: { 2: { "model-a": { status: 429 } } } });
+ await startRelays(sc);
+ const r = await runOnce(sc, { ROTATE_SPACING_MS: "0" }, ["--fresh-ip-sweep"]);
+ assert.equal(r.code, 0, r.stdout + r.stderr);
+ const lines = dockerLines(sc);
+ assert.ok(lines.some((l) => l.startsWith("exec warp-relay-warp-1 rm -f /etc/wireguard/wg0.conf")), "warp-1 rm wg0.conf recorded");
+ assert.ok(lines.some((l) => l.startsWith("restart warp-relay-warp-1")), "warp-1 restart recorded");
+ assert.ok(lines.some((l) => l.startsWith("exec warp-relay-warp-2 rm -f /etc/wireguard/wg0.conf")), "warp-2 rm wg0.conf recorded");
+ assert.ok(lines.some((l) => l.startsWith("restart warp-relay-warp-2")), "warp-2 restart recorded");
+ assert.match(r.stdout, /fresh IP verified/i);
+});
+
+test("--fresh-ip-sweep identifies global upstream quota when all relays return 429", async () => {
+ const sc = newScenario({
+  count: 2,
+  throttle: {
+   1: { "model-a": { status: 429 } },
+   2: { "model-a": { status: 429 } },
+  },
+ });
+ await startRelays(sc);
+ const r = await runOnce(sc, { ROTATE_SPACING_MS: "0", GLOBAL_QUOTA_GUARD: "2" }, ["--fresh-ip-sweep"]);
+ assert.equal(r.code, 1, r.stdout + r.stderr);
+ const restarts = restartLines(sc);
+ assert.equal(restarts.length, 2, "all relays rotated once");
+ assert.match(r.stdout, /global.*upstream.*quota/i);
+});
+
+test("--fresh-ip-sweep aborts during preflight if a container lacks wg0.conf", async () => {
+ const sc = newScenario({ count: 2 });
+ await startRelays(sc);
+ const r = await runOnce(sc, { FAKE_DOCKER_MISSING_WG0: "warp-relay-warp-2" }, ["--fresh-ip-sweep"]);
+ assert.equal(r.code, 1, r.stdout + r.stderr);
+ assert.deepEqual(restartLines(sc), [], "zero restarts performed on preflight failure");
+ assert.match(r.stderr + r.stdout, /preflight|wg0\.conf/i);
+});
+
+test("--fresh-ip-sweep rejects mutual exclusion with --once or --loop", async () => {
+ const sc = newScenario({ count: 1 });
+ const rOnce = await runOnce(sc, {}, ["--fresh-ip-sweep", "--once"]);
+ assert.equal(rOnce.code, 2);
+ assert.match(rOnce.stderr, /mutually exclusive/i);
+
+ const rLoop = await runOnce(sc, {}, ["--fresh-ip-sweep", "--loop"]);
+ assert.equal(rLoop.code, 2);
+ assert.match(rLoop.stderr, /mutually exclusive/i);
+});
+
+// ── case 12: --reset-until-clean contract ───────────────────────────
+test("--reset-until-clean skips already clean relays and resets only rate-limited relays until clean", async () => {
+ let r3Attempts = 0;
+ let r4Attempts = 0;
+ const sc = newScenario({
+  count: 4,
+  throttle: {
+   3: {
+    "model-a": () => {
+     r3Attempts++;
+     return r3Attempts <= 1 ? { status: 429 } : null;
+    },
+   },
+   4: {
+    "model-a": () => {
+     r4Attempts++;
+     return r4Attempts <= 2 ? { status: 429 } : null;
+    },
+   },
+  },
+ });
+ await startRelays(sc);
+ const r = await runOnce(sc, { ROTATE_SPACING_MS: "0" }, ["--reset-until-clean"]);
+ assert.equal(r.code, 0, r.stdout + r.stderr);
+ const restarts = restartLines(sc);
+ assert.equal(restarts.filter((l) => l.includes("warp-relay-warp-1")).length, 0, "warp-1 never reset");
+ assert.equal(restarts.filter((l) => l.includes("warp-relay-warp-2")).length, 0, "warp-2 never reset");
+ assert.equal(restarts.filter((l) => l.includes("warp-relay-warp-3")).length, 1, "warp-3 reset exactly once");
+ assert.equal(restarts.filter((l) => l.includes("warp-relay-warp-4")).length, 2, "warp-4 reset exactly twice");
+ assert.match(r.stdout, /all.*clean|reset complete/i);
+});
+
+test("--reset-until-clean respects MAX_RESET_ATTEMPTS and exits 1 if relay remains throttled", async () => {
+ const sc = newScenario({
+  count: 2,
+  throttle: {
+   2: { "model-a": { status: 429 } },
+  },
+ });
+ await startRelays(sc);
+ const r = await runOnce(sc, { ROTATE_SPACING_MS: "0", MAX_RESET_ATTEMPTS: "2" }, ["--reset-until-clean"]);
+ assert.equal(r.code, 1, r.stdout + r.stderr);
+ const restarts = restartLines(sc);
+ assert.equal(restarts.filter((l) => l.includes("warp-relay-warp-1")).length, 0, "warp-1 never reset");
+ assert.equal(restarts.filter((l) => l.includes("warp-relay-warp-2")).length, 2, "warp-2 reset exactly 2 times");
+ assert.match(r.stdout + r.stderr, /exceeded|throttled|rate-limited/i);
+});
+
+test("--reset-until-clean never resets a relay failing for a non-rate-limit reason", async () => {
+ const sc = newScenario({
+  count: 3,
+  throttle: {
+   2: { "model-a": { status: 401 } },
+   3: { "model-a": { status: 429 } },
+  },
+ });
+ await startRelays(sc);
+ const r = await runOnce(sc, { ROTATE_SPACING_MS: "0", MAX_RESET_ATTEMPTS: "1" }, ["--reset-until-clean"]);
+ assert.equal(r.code, 1, r.stdout + r.stderr);
+ const restarts = restartLines(sc);
+ assert.equal(restarts.filter((l) => l.includes("warp-relay-warp-2")).length, 0, "a 401 is not an egress problem");
+ assert.equal(restarts.filter((l) => l.includes("warp-relay-warp-3")).length, 1, "the 429 relay is reset once");
+ assert.match(r.stdout, /#2 not an egress rate limit/);
+});
+
+test("--reset-until-clean rejects mutual exclusion with --once, --loop, or --fresh-ip-sweep", async () => {
+ const sc = newScenario({ count: 1 });
+ const rOnce = await runOnce(sc, {}, ["--reset-until-clean", "--once"]);
+ assert.equal(rOnce.code, 2);
+ assert.match(rOnce.stderr, /mutually exclusive/i);
+
+ const rLoop = await runOnce(sc, {}, ["--reset-until-clean", "--loop"]);
+ assert.equal(rLoop.code, 2);
+ assert.match(rLoop.stderr, /mutually exclusive/i);
+
+ const rSweep = await runOnce(sc, {}, ["--reset-until-clean", "--fresh-ip-sweep"]);
+ assert.equal(rSweep.code, 2);
+ assert.match(rSweep.stderr, /mutually exclusive/i);
+});
+
+// ── case 13: per-egress rotation contract ───────────────────────────
+test("--reset-until-clean soft-restarts first and spends no Cloudflare registration", async () => {
+ let attempts = 0;
+ const sc = newScenario({
+  count: 2,
+  throttle: {
+   2: {
+    "model-a": () => {
+     attempts++;
+     return attempts <= 1 ? { status: 429 } : null;
+    },
+   },
+  },
+ });
+ await startRelays(sc);
+ const r = await runOnce(
+  sc,
+  { ROTATE_SPACING_MS: "0", TARGET_MODEL: "model-a" },
+  ["--reset-until-clean"],
+ );
+ assert.equal(r.code, 0, r.stdout + r.stderr);
+ const lines = dockerLines(sc);
+ assert.equal(lines.filter((l) => l.includes("rm -f /etc/wireguard/wg0.conf")).length, 0, "no wg0.conf deleted: tier-1 only");
+ assert.equal(lines.filter((l) => l.startsWith("restart warp-relay-warp-2")).length, 1, "one soft restart");
+ assert.match(r.stdout, /soft restart \(t1\)/);
+ assert.match(r.stdout, /got 200 streaming \(CLEAN\)/);
+});
+
+test("--reset-until-clean escalates to a full reset when the soft restart cannot move the egress", async () => {
+ const sc = newScenario({ count: 2, throttle: { 2: { "model-a": { status: 429 } } } });
+ await startRelays(sc);
+ const r = await runOnce(
+  sc,
+  {
+   ROTATE_SPACING_MS: "0",
+   READY_TIMEOUT_MS: "4000",
+   MAX_RESET_ATTEMPTS: "1",
+   FAKE_DOCKER_STICKY_RESTARTS: "1",
+   TARGET_MODEL: "model-a",
+  },
+  ["--reset-until-clean"],
+ );
+ assert.equal(r.code, 1, r.stdout + r.stderr);
+ const lines = dockerLines(sc);
+ assert.equal(lines.filter((l) => l.includes("rm -f /etc/wireguard/wg0.conf")).length, 1, "one full reset after the stuck soft restart");
+ assert.equal(lines.filter((l) => l.startsWith("restart warp-relay-warp-2")).length, 2, "soft restart then full reset");
+ assert.match(r.stdout, /kept the same egress — escalating to a full reset/);
+});
+
+test("--reset-until-clean rejects a new address inside the same throttled /64 and escalates", async () => {
+ const sc = newScenario({ count: 2, throttle: { 2: { "model-a": { status: 429 } } } });
+ await startRelays(sc);
+ const r = await runOnce(
+  sc,
+  {
+   ROTATE_SPACING_MS: "0",
+   READY_TIMEOUT_MS: "4000",
+   MAX_RESET_ATTEMPTS: "1",
+   FAKE_DOCKER_PREFIX_STICKY: "1",
+   TARGET_MODEL: "model-a",
+  },
+  ["--reset-until-clean"],
+ );
+ assert.equal(r.code, 1, r.stdout + r.stderr);
+ const lines = dockerLines(sc);
+ assert.equal(lines.filter((l) => l.includes("rm -f /etc/wireguard/wg0.conf")).length, 1, "same-/64 address is not a fresh egress: full reset");
+ assert.equal(lines.filter((l) => l.startsWith("restart warp-relay-warp-2")).length, 2, "soft restart then full reset");
+ assert.match(r.stdout, /kept the same egress — escalating to a full reset/);
+});
+
+test("--reset-until-clean keeps rotating through multi-hour retry-after instead of halting", async () => {
+ let attempts = 0;
+ const sc = newScenario({
+  count: 2,
+  throttle: {
+   2: {
+    "model-a": () => {
+     attempts++;
+     return attempts <= 2 ? { status: 429, retryAfter: 25000 } : null;
+    },
+   },
+  },
+ });
+ await startRelays(sc);
+ const r = await runOnce(
+  sc,
+  { ROTATE_SPACING_MS: "0", MAX_RESET_ATTEMPTS: "4", TARGET_MODEL: "model-a" },
+  ["--reset-until-clean"],
+ );
+ assert.equal(r.code, 0, r.stdout + r.stderr);
+ const restarts = restartLines(sc);
+ assert.equal(restarts.filter((l) => l.includes("warp-relay-warp-2")).length, 2, "kept rotating until the address streamed");
+ assert.match(r.stdout, /retry-after: 25000/);
+ assert.doesNotMatch(r.stdout, /Halting resets/);
+ assert.match(r.stdout, /got 200 streaming \(CLEAN\)/);
+});
+
+test("--reset-until-clean keeps retrying a zero-yield round until MAX_RESET_ATTEMPTS", async () => {
+ const sc = newScenario({
+  count: 4,
+  throttle: {
+   1: { "model-a": { status: 429 } },
+   2: { "model-a": { status: 429 } },
+   3: { "model-a": { status: 429 } },
+   4: { "model-a": { status: 429 } },
+  },
+ });
+ await startRelays(sc);
+ const r = await runOnce(
+  sc,
+  { ROTATE_SPACING_MS: "0", MAX_RESET_ATTEMPTS: "2", TARGET_MODEL: "model-a" },
+  ["--reset-until-clean"],
+ );
+ assert.equal(r.code, 1, r.stdout + r.stderr);
+ assert.equal(restartLines(sc).length, 8, "every relay rotates on both rounds; no zero-yield halt");
+ assert.match(r.stdout, /round 2\/2/);
+});
+
+test("--reset-until-clean ceiling blocks tier-2 escalation but soft restarts continue", async () => {
+ const sc = newScenario({
+  count: 3,
+  throttle: {
+   1: { "model-a": { status: 429 } },
+   2: { "model-a": { status: 429 } },
+   3: { "model-a": { status: 429 } },
+  },
+ });
+ await startRelays(sc);
+ const r = await runOnce(
+  sc,
+  {
+   ROTATE_SPACING_MS: "0",
+   MAX_RESET_ATTEMPTS: "2",
+   SOFT_ROTATIONS_BEFORE_TIER2: "1",
+   MAX_POOL_REGISTRATIONS_PER_HOUR: "1",
+   TARGET_MODEL: "model-a",
+  },
+  ["--reset-until-clean"],
+ );
+ assert.equal(r.code, 1, r.stdout + r.stderr);
+ const lines = dockerLines(sc);
+ assert.equal(lines.filter((l) => l.includes("rm -f /etc/wireguard/wg0.conf")).length, 1, "only one registration spent");
+ assert.equal(restartLines(sc).length, 6, "all three relays still rotated on both rounds");
+ assert.match(r.stdout, /\[ceiling\]/);
+});
+
+
+test("--probe reports per-relay status without touching any container", async () => {
+ const sc = newScenario({
+  count: 3,
+  throttle: { 2: { "model-a": { status: 429, retryAfter: 7200 } } },
+ });
+ await startRelays(sc);
+ const r = await runOnce(sc, { TARGET_MODEL: "model-a" }, ["--probe"]);
+ assert.equal(r.code, 1, r.stdout + r.stderr);
+ assert.deepEqual(dockerLines(sc), [], "probe mode never invokes docker");
+ assert.match(r.stdout, /#1 200 streaming/);
+ assert.match(r.stdout, /#2 429 rate limited \(retry-after: 7200s\)/);
+ assert.match(r.stdout, /probe summary: 2\/3 streaming 200/);
+ assert.equal(fs.existsSync(sc.stateFile), false, "probe mode writes no state");
+});
+
+test("auto-discovers free models from OpenCode when PROBE_MODELS is omitted", async () => {
+ const sc = newScenario({ count: 1 });
+ await startRelays(sc);
+ const mockPort = takeBlock();
+ const mockServer = http.createServer((req, res) => {
+  if (req.url === "/opencode.ai/inference/v1/models") {
+   res.writeHead(200, { "content-type": "application/json" });
+   res.end(
+    JSON.stringify({
+     data: [
+      { id: "deepseek-v4.1-flash-free" },
+      { id: "mimo-v2.6-flash-free" },
+      { id: "paid-gpt-4o" },
+      { id: "jev-1.13-free" },
+      { id: "nemotron-3.5-lightning-free" },
+     ],
+    }),
+   );
+   return;
+  }
+  res.writeHead(200, { "content-type": "text/event-stream" });
+  res.end("data: {}\\n\\n");
+ });
+ servers.push(mockServer);
+ await new Promise((resolve) => mockServer.listen(mockPort, "127.0.0.1", resolve));
+
+ const r = await runOnce(sc, {
+  PROBE_TARGET: `http://127.0.0.1:${mockPort}/opencode.ai`,
+  PROBE_MODELS: undefined,
+ });
+ assert.equal(r.code, 0, r.stdout + r.stderr);
+ assert.match(r.stdout, /auto-discovered 3 free model\(s\) from OpenCode/);
+ assert.match(r.stdout, /deepseek-v4.1-flash-free/);
+ assert.doesNotMatch(r.stdout, /paid-gpt-4o/);
+ assert.doesNotMatch(r.stdout, /jev-1.13-free/);
+});
+
+test("falls back to default OpenCode free models if discovery endpoint fails", async () => {
+ const sc = newScenario({ count: 1 });
+ await startRelays(sc);
+ const r = await runOnce(
+  sc,
+  {
+   PROBE_TARGET: "http://127.0.0.1:24999/opencode.ai",
+   PROBE_MODELS: undefined,
+  },
+  ["--probe"],
+ );
+ assert.match(r.stdout, /deepseek-v4.1-flash-free/);
 });

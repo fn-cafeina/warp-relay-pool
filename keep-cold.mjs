@@ -112,13 +112,13 @@
  *   BASE_PORT           first relay port              (default 3000)
  *   COUNT               number of relays              (default 10)
  *   PROBE_TARGET        upstream the probes go through (default
- *                       https://api.kilo.ai — the lane clients actually use)
+ *                       https://opencode.ai — OpenCode Zen inference)
  *   PROBE_CHAT_PATH     chat wire path under PROBE_TARGET (default
- *                       /api/gateway/chat/completions)
+ *                       /inference/v1/chat/completions)
  *   PROBE_RESPONSES_PATH  responses wire path under PROBE_TARGET (default
- *                       /api/gateway/responses)
- *   PROBE_MODELS        comma-separated models to probe (default three
- *                       families so per-model throttles stay distinguishable)
+ *                       /inference/v1/responses)
+ *   PROBE_MODELS        comma-separated models to probe (default: dynamically
+ *                       discovered free tag models from OpenCode)
  *   PROBE_MODEL         legacy single-model override (used only when
  *                       PROBE_MODELS is unset)
  *   RESPONSES_MODELS    comma-separated models probed via PROBE_RESPONSES_PATH
@@ -154,14 +154,17 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-const USAGE = `Usage: node keep-cold.mjs [--once|--loop] [--help]
+const USAGE = `Usage: node keep-cold.mjs [--once|--loop|--probe|--fresh-ip-sweep|--reset-until-clean] [--help]
 
-  --once   single pass (the default; what the systemd timer runs)
-  --loop   pass every INTERVAL_S seconds (foreground)
-  --help   print this text and exit`;
+  --once             single pass (the default; what the systemd timer runs)
+  --loop             pass every INTERVAL_S seconds (foreground)
+  --probe            read-only per-relay probe report (no rotation, no state writes)
+  --fresh-ip-sweep   full-pool tier-2 re-key + fresh IP verification + probe sweep
+  --reset-until-clean smart targeted full reset of rate-limited relays until 200 OK
+  --help             print this text and exit`;
 
 const argv = process.argv.slice(2);
-const unknownArgs = argv.filter((a) => !["--once", "--loop", "--help", "-h"].includes(a));
+const unknownArgs = argv.filter((a) => !["--once", "--loop", "--probe", "--status", "--fresh-ip-sweep", "--reset-until-clean", "--help", "-h"].includes(a));
 if (unknownArgs.length) {
  console.error(`keep-cold: unknown argument(s): ${unknownArgs.join(" ")}`);
  console.error(USAGE);
@@ -171,9 +174,15 @@ if (argv.includes("--help") || argv.includes("-h")) {
  console.log(USAGE);
  process.exit(0);
 }
+const PROBE_ONLY = argv.includes("--probe") || argv.includes("--status");
+const FRESH_IP_SWEEP = argv.includes("--fresh-ip-sweep");
+const RESET_UNTIL_CLEAN = argv.includes("--reset-until-clean");
 const LOOP = argv.includes("--loop");
-if (LOOP && argv.includes("--once")) {
- console.error("keep-cold: --once and --loop are mutually exclusive");
+const ONCE = argv.includes("--once");
+
+const modeFlags = [ONCE, LOOP, PROBE_ONLY, FRESH_IP_SWEEP, RESET_UNTIL_CLEAN].filter(Boolean);
+if (modeFlags.length > 1) {
+ console.error("keep-cold: --once, --loop, --probe, --fresh-ip-sweep, and --reset-until-clean are mutually exclusive");
  process.exit(2);
 }
 
@@ -235,21 +244,124 @@ function envFile(name, dflt) {
  return value;
 }
 
+// ── Logging ─────────────────────────────────────────────────────────
+const LOG_PATH = process.env.KEEP_COLD_LOG ?? "";
+const LOG_MAX_BYTES = envInt("KEEP_COLD_LOG_MAX_BYTES", 2 * 1024 * 1024, { min: 1 });
+const LOG_KEEP_BYTES = envInt("KEEP_COLD_LOG_KEEP_BYTES", 200 * 1024, { min: 1 });
+if (LOG_KEEP_BYTES >= LOG_MAX_BYTES) {
+ console.error("keep-cold: KEEP_COLD_LOG_KEEP_BYTES must be smaller than KEEP_COLD_LOG_MAX_BYTES");
+ process.exit(2);
+}
+
+/** Trim the log once it passes the cap, keeping the newest whole lines. */
+function rotateLogIfNeeded() {
+ try {
+  if (fs.statSync(LOG_PATH).size <= LOG_MAX_BYTES) return;
+  const buf = fs.readFileSync(LOG_PATH);
+  const tail = buf.subarray(Math.max(0, buf.length - LOG_KEEP_BYTES));
+  const nl = tail.indexOf(0x0a);
+  const kept = nl >= 0 ? tail.subarray(nl + 1) : tail;
+  // temp+rename: a kill mid-rotation must not lose the whole log, and a
+  // concurrent manual run must not interleave with a truncate-then-write.
+  const tmp = `${LOG_PATH}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, kept);
+  fs.renameSync(tmp, LOG_PATH);
+ } catch {
+  // Missing log file — nothing to rotate.
+ }
+}
+
+/** Always to stdout (journald captures it); optionally also to a file. */
+function log(msg) {
+ const line = `[${new Date().toISOString()}] ${msg}\n`;
+ process.stdout.write(line);
+ if (!LOG_PATH) return;
+ try {
+  rotateLogIfNeeded();
+  fs.appendFileSync(LOG_PATH, line);
+ } catch {
+  // Logging must never break a pass.
+ }
+}
+
 const RELAY_HOST = process.env.RELAY_HOST ?? "10.244.0.100";
 const BASE_PORT = envInt("BASE_PORT", 3000, { max: 65535 });
 const COUNT = envInt("COUNT", 10, { min: 1, max: 64 });
-const PROBE_TARGET = envUrl("PROBE_TARGET", "https://api.kilo.ai");
-const PROBE_CHAT_PATH = envPath("PROBE_CHAT_PATH", "/api/gateway/chat/completions");
-const PROBE_RESPONSES_PATH = envPath("PROBE_RESPONSES_PATH", "/api/gateway/responses");
-const PROBE_MODELS = (process.env.PROBE_MODELS
- ?? process.env.PROBE_MODEL
- ?? "nvidia/nemotron-3.5-lightning:free,cohere/north-mini-code:free,dots-studio/dots-3-note-preview:free")
- .split(",")
- .map((s) => s.trim())
- .filter(Boolean);
-if (PROBE_MODELS.length === 0) {
- console.error("keep-cold: PROBE_MODELS is empty — nothing to probe");
- process.exit(2);
+const PROBE_TARGET = envUrl("PROBE_TARGET", "https://opencode.ai");
+const PROBE_CHAT_PATH = envPath("PROBE_CHAT_PATH", "/inference/v1/chat/completions");
+const PROBE_RESPONSES_PATH = envPath("PROBE_RESPONSES_PATH", "/inference/v1/responses");
+
+const DEFAULT_FALLBACK_OPENCODE_FREE_MODELS = [
+ "deepseek-v4.1-flash-free",
+ "mimo-v2.6-flash-free",
+ "nemotron-3.5-lightning-free",
+ "glm-5.3-flash-free",
+];
+
+const EXCLUDE_PROBE_MODELS = new Set([
+ "jev-1.13-free", // non-chat decision model, 400s on chat
+ "deepseek-v4-flash-free", // unserved upstream (400 unavailable)
+]);
+
+/**
+ * Dynamically discover free tag models from OpenCode Zen.
+ * Probes the upstream models endpoint and extracts models containing
+ * '-free', ':free', or '/free', ensuring rotation survives model catalogue updates.
+ */
+async function discoverOpenCodeFreeModels(targetUrl) {
+ try {
+  const url = `${targetUrl.replace(/\/+$/, "")}/inference/v1/models`;
+  const res = await fetch(url, {
+   headers: {
+    "user-agent": "opencode/1.18.31",
+    "x-opencode-client": "cli",
+    "accept": "application/json",
+   },
+   signal: AbortSignal.timeout(5000),
+  });
+  if (res.ok) {
+   const body = await res.json();
+   const list = Array.isArray(body) ? body : (body && Array.isArray(body.data) ? body.data : []);
+   const freeIds = list
+    .map((m) => (m && typeof m.id === "string" ? m.id.trim() : ""))
+    .filter((id) => id && (id.includes("-free") || id.includes(":free") || id.includes("/free")) && !EXCLUDE_PROBE_MODELS.has(id));
+   if (freeIds.length > 0) {
+    freeIds.sort((a, b) => {
+     if (a === "deepseek-v4.1-flash-free") return -1;
+     if (b === "deepseek-v4.1-flash-free") return 1;
+     return a.localeCompare(b);
+    });
+    return freeIds;
+   }
+  }
+ } catch {
+  // Offline, mock/test environment, or network timeout -> fallback safely
+ }
+ return DEFAULT_FALLBACK_OPENCODE_FREE_MODELS;
+}
+
+const rawProbeEnv = process.env.PROBE_MODELS ?? process.env.PROBE_MODEL;
+let PROBE_MODELS;
+if (rawProbeEnv !== undefined) {
+ if (rawProbeEnv.trim() === "") {
+  console.error("keep-cold: PROBE_MODELS is set but blank");
+  process.exit(2);
+ }
+ PROBE_MODELS = rawProbeEnv
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+ if (PROBE_MODELS.length === 0) {
+  console.error("keep-cold: PROBE_MODELS is empty — nothing to probe");
+  process.exit(2);
+ }
+} else {
+ if (PROBE_TARGET.includes("opencode.ai")) {
+  PROBE_MODELS = await discoverOpenCodeFreeModels(PROBE_TARGET);
+  log(`auto-discovered ${PROBE_MODELS.length} free model(s) from OpenCode: ${PROBE_MODELS.join(", ")}`);
+ } else {
+  PROBE_MODELS = ["nvidia/nemotron-3.5-lightning:free", "cohere/north-mini-code:free", "dots-studio/dots-3-note-preview:free"];
+ }
 }
 const RESPONSES_MODELS = new Set(
  (process.env.RESPONSES_MODELS
@@ -258,7 +370,11 @@ const RESPONSES_MODELS = new Set(
   .map((s) => s.trim())
   .filter(Boolean),
 );
+const FRESH_IP_MODEL = process.env.FRESH_IP_MODEL ?? PROBE_MODELS[0];
+const MAX_RESET_ATTEMPTS = envInt("MAX_RESET_ATTEMPTS", 10, { min: 1, max: 50 });
+const SOFT_ROTATIONS_BEFORE_TIER2 = envInt("SOFT_ROTATIONS_BEFORE_TIER2", 1, { min: 1, max: 50 });
 const GLOBAL_QUOTA_GUARD = Math.min(envInt("GLOBAL_QUOTA_GUARD", Math.max(8, COUNT - 1), { min: 1 }), COUNT);
+const MAX_POOL_REGISTRATIONS_PER_HOUR = envInt("MAX_POOL_REGISTRATIONS_PER_HOUR", 60, { min: 1, max: 200 });
 const SPEED_MODEL = process.env.SPEED_MODEL ?? "nvidia/nemotron-3.5-lightning:free";
 const SLOW_THRESHOLD_MS = envInt("SLOW_THRESHOLD_MS", 0);
 const CONTAINER_PREFIX = process.env.CONTAINER_PREFIX ?? "warp-relay-warp-";
@@ -291,7 +407,7 @@ const DOCKER_PREFIX_ARGS = (process.env.DOCKER_PREFIX_ARGS ?? "").split(/\s+/).f
 // ignored: this controller no longer waits for readiness or verifies a
 // rotation inline. Parsed (not just read) so a broken unit file still fails
 // fast instead of silently changing behaviour.
-envInt("READY_TIMEOUT_MS", 180_000, { min: 1 });
+const READY_TIMEOUT_MS = envInt("READY_TIMEOUT_MS", 180_000, { min: 1 });
 envInt("SOCKS_PORT_BASE", 10800, { min: 1, max: 65535 });
 envInt("MAX_ROTATIONS", 4, { min: 1 });
 envInt("SLOW_MAX_ROTATIONS", 2);
@@ -375,13 +491,14 @@ function buildProbe(model) {
 }
 
 function probeHeaders(relayPath) {
- return {
+ const isOpenCode = PROBE_TARGET.includes("opencode.ai");
+ const sid = sessionId();
+ const headers = {
   "content-type": "application/json",
   "user-agent": "opencode/1.18.31",
   "x-opencode-client": OPENCODE_CLIENT,
   "x-opencode-project": OPENCODE_PROJECT,
-  "x-opencode-session": sessionId(),
-  "x-opencode-request": `msg_${randomBytes(6).toString("hex")}${randomBytes(14).toString("base64url").slice(0, 14)}`,
+  "x-opencode-session": sid,
   // Route through the in-container relay app; the public tunnel is bypassed
   // on purpose so a rotation never depends on tunnel state.
   "x-relay-target": PROBE_TARGET,
@@ -392,46 +509,15 @@ function probeHeaders(relayPath) {
   "x-keep-cold-probe": "1",
   accept: "text/event-stream",
  };
-}
-
-// ── Logging ─────────────────────────────────────────────────────────
-const LOG_PATH = process.env.KEEP_COLD_LOG ?? "";
-const LOG_MAX_BYTES = envInt("KEEP_COLD_LOG_MAX_BYTES", 2 * 1024 * 1024, { min: 1 });
-const LOG_KEEP_BYTES = envInt("KEEP_COLD_LOG_KEEP_BYTES", 200 * 1024, { min: 1 });
-if (LOG_KEEP_BYTES >= LOG_MAX_BYTES) {
- console.error("keep-cold: KEEP_COLD_LOG_KEEP_BYTES must be smaller than KEEP_COLD_LOG_MAX_BYTES");
- process.exit(2);
-}
-
-/** Trim the log once it passes the cap, keeping the newest whole lines. */
-function rotateLogIfNeeded() {
- try {
-  if (fs.statSync(LOG_PATH).size <= LOG_MAX_BYTES) return;
-  const buf = fs.readFileSync(LOG_PATH);
-  const tail = buf.subarray(Math.max(0, buf.length - LOG_KEEP_BYTES));
-  const nl = tail.indexOf(0x0a);
-  const kept = nl >= 0 ? tail.subarray(nl + 1) : tail;
-  // temp+rename: a kill mid-rotation must not lose the whole log, and a
-  // concurrent manual run must not interleave with a truncate-then-write.
-  const tmp = `${LOG_PATH}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, kept);
-  fs.renameSync(tmp, LOG_PATH);
- } catch {
-  // Missing log file — nothing to rotate.
+ if (isOpenCode) {
+  headers["authorization"] = "Bearer public";
+  headers["x-opencode-session-id"] = sid;
+  headers["x-session-affinity"] = sid;
+  headers["x-session-id"] = sid;
+ } else {
+  headers["x-opencode-request"] = `msg_${randomBytes(6).toString("hex")}${randomBytes(14).toString("base64url").slice(0, 14)}`;
  }
-}
-
-/** Always to stdout (journald captures it); optionally also to a file. */
-function log(msg) {
- const line = `[${new Date().toISOString()}] ${msg}\n`;
- process.stdout.write(line);
- if (!LOG_PATH) return;
- try {
-  rotateLogIfNeeded();
-  fs.appendFileSync(LOG_PATH, line);
- } catch {
-  // Logging must never break a pass.
- }
+ return headers;
 }
 
 // ── Per-relay state ─────────────────────────────────────────────────
@@ -696,6 +782,333 @@ async function probeRelay(index, models = PROBE_MODELS) {
  return out;
 }
 
+/** Query a container's current egress IPv6 via Cloudflare trace. */
+async function getEgressIp(index) {
+ try {
+  const out = await docker(["exec", containerName(index), "curl", "-s", "-m", "8", "https://cloudflare.com/cdn-cgi/trace"], 25_000);
+  const ipMatch = out.match(/^ip=(.+)$/m);
+  const warpMatch = out.match(/^warp=(.+)$/m);
+  if (ipMatch && warpMatch && warpMatch[1].trim() === "on") {
+   return ipMatch[1].trim();
+  }
+  return null;
+ } catch {
+  return null;
+ }
+}
+
+/**
+ * Expand an IPv6 literal and return its /64. Upstream throttle state follows
+ * the block, not the interface address: two containers can hold different
+ * addresses inside one throttled /64 and share the same 429 window, so a
+ * rotation that only moves the suffix has changed nothing.
+ */
+function egressPrefix(ip) {
+ const [head, tail = ""] = String(ip).split("::");
+ const headParts = head ? head.split(":") : [];
+ const tailParts = tail ? tail.split(":") : [];
+ const missing = Math.max(0, 8 - headParts.length - tailParts.length);
+ const full = [...headParts, ...Array(missing).fill("0"), ...tailParts];
+ return full.slice(0, 4).join(":");
+}
+
+/**
+ * --fresh-ip-sweep: serial full reset (tier-2) of every relay in the pool,
+ * verifying each relay receives a distinct fresh egress IP from Cloudflare,
+ * then probing a single target model to separate per-relay rate limits from
+ * global upstream quota.
+ */
+async function freshIpSweep() {
+ const state = loadState();
+ const initialIps = new Map();
+
+ // ── Phase 1: Preflight ──
+ for (let i = 1; i <= COUNT; i++) {
+  let hasWg0 = false;
+  try {
+   await docker(["exec", containerName(i), "test", "-f", "/etc/wireguard/wg0.conf"], 30_000);
+   hasWg0 = true;
+  } catch {
+   hasWg0 = false;
+  }
+  if (!hasWg0) {
+   log(`#${i} preflight failed: missing /etc/wireguard/wg0.conf — aborting fresh-IP sweep with zero mutations`);
+   return false;
+  }
+  const ip = await getEgressIp(i);
+  if (!ip) {
+   log(`#${i} preflight failed: unable to query egress IP`);
+   return false;
+  }
+  initialIps.set(i, ip);
+ }
+ log(`preflight passed: ${COUNT}/${COUNT} relays verified with active wg0.conf`);
+
+ // ── Phase 2: Serial Full-Reset + IP verification + Probe ──
+ const cleanRelays = [];
+ const throttledRelays = [];
+ const failedRotations = [];
+
+ for (let index = 1; index <= COUNT; index++) {
+  const oldIp = initialIps.get(index);
+  const container = containerName(index);
+  const at = await enqueueRestart(async () => {
+   const started = now();
+   log(`#${index} full reset (t2) — deleting wg0.conf and restarting ${container}`);
+   await docker(["exec", container, "rm", "-f", "/etc/wireguard/wg0.conf"], 30_000);
+   await docker(["restart", container], 60_000);
+   saveTier2State(index, started);
+   return started;
+  });
+
+  // Poll for a fresh /64
+  const deadline = Date.now() + READY_TIMEOUT_MS;
+  const oldPrefix = egressPrefix(oldIp);
+  let newIp = null;
+  while (Date.now() < deadline) {
+   newIp = await getEgressIp(index);
+   if (newIp && egressPrefix(newIp) !== oldPrefix) break;
+   await sleep(3000);
+  }
+
+  if (!newIp || egressPrefix(newIp) === oldPrefix) {
+   log(`#${index} fresh IP verification failed (same IP or not ready)`);
+   failedRotations.push(index);
+   continue;
+  }
+  log(`#${index} fresh IP verified (changed from previous egress)`);
+
+  patchRelay(state, index, { lastRotate: at, consecutiveFailures: 0, dirty: false, pendingVerify: false });
+
+  const [res] = await probeRelay(index, [FRESH_IP_MODEL]);
+  if (res.status === 200 && !res.serverError) {
+   log(`#${index} probe ${FRESH_IP_MODEL} -> 200 OK (clean)`);
+   cleanRelays.push(index);
+  } else if (res.status === 429) {
+   log(`#${index} probe ${FRESH_IP_MODEL} -> 429 rate limited` + (res.retryAfter ? ` (retry-after: ${res.retryAfter}s)` : ""));
+   throttledRelays.push(index);
+   patchRelay(state, index, { dirty: true, last429: { model: FRESH_IP_MODEL, ts: now() } });
+  } else {
+   log(`#${index} probe ${FRESH_IP_MODEL} -> HTTP ${res.status || "unreachable"} (${res.detail})`);
+  }
+ }
+
+ // ── Phase 3: Summary and Exit ──
+ log(`fresh-IP sweep complete: ${cleanRelays.length}/${COUNT} clean, ${throttledRelays.length}/${COUNT} throttled, ${failedRotations.length} failed verification`);
+ if (cleanRelays.length > 0) {
+  log(`success: ${cleanRelays.length} relay(s) cleared rate limits on ${FRESH_IP_MODEL}`);
+  return true;
+ }
+ if (throttledRelays.length >= GLOBAL_QUOTA_GUARD) {
+  log(`${FRESH_IP_MODEL} throttled on ${throttledRelays.length}/${COUNT} relays across fresh IPs — confirmed global upstream quota`);
+  return false;
+ }
+ return false;
+}
+
+/**
+ * --probe: read-only per-relay status using the exact production probe shape.
+ * No docker calls, no rotation, no state writes — safe to run any time,
+ * including while the timer pass is mid-flight.
+ */
+async function probePool() {
+ const targetModel = process.env.TARGET_MODEL ?? process.env.FRESH_IP_MODEL ?? PROBE_MODELS[0];
+ log(`probing ${COUNT} relay(s) on ${targetModel}...`);
+ const rows = [];
+ await runPool(
+  Array.from({ length: COUNT }, (_, i) => i + 1),
+  PROBE_CONCURRENCY,
+  async (index) => {
+   const [res] = await probeRelay(index, [targetModel]);
+   rows.push({ index, res });
+  },
+ );
+ rows.sort((a, b) => a.index - b.index);
+ let clean = 0;
+ for (const { index, res } of rows) {
+  if (res.status === 200 && !res.serverError) {
+   clean++;
+   log(`#${index} 200 streaming`);
+  } else if (res.status === 429) {
+   log(`#${index} 429 rate limited` + (res.retryAfter ? ` (retry-after: ${res.retryAfter}s)` : ""));
+  } else {
+   log(`#${index} ${res.status || "unreachable"} ${res.detail}`.slice(0, 200));
+  }
+ }
+ log(`probe summary: ${clean}/${COUNT} streaming 200 on ${targetModel}`);
+ return clean === COUNT;
+}
+
+/**
+ * Smart targeted full reset of rate-limited relays until 200 OK.
+ */
+async function resetUntilClean() {
+ const state = loadState();
+ const targetModel = process.env.TARGET_MODEL ?? process.env.FRESH_IP_MODEL ?? PROBE_MODELS[0];
+
+ // ── Preflight ──
+ for (let i = 1; i <= COUNT; i++) {
+  let hasWg0 = false;
+  try {
+   await docker(["exec", containerName(i), "test", "-f", "/etc/wireguard/wg0.conf"], 30_000);
+   hasWg0 = true;
+  } catch {
+   hasWg0 = false;
+  }
+  if (!hasWg0) {
+   log(`#${i} preflight failed: missing /etc/wireguard/wg0.conf`);
+   return false;
+  }
+ }
+
+ // ── Baseline Evaluation ──
+ log(`evaluating pool baseline for ${COUNT} relay(s) on ${targetModel}...`);
+ const cleanIndexes = [];
+ const throttledIndexes = [];
+ // Anything that is neither 200 nor 429 (401 auth, 403 gate, 400 protocol,
+ // unreachable) is not an egress problem: a reset cannot fix it and would burn
+ // a Cloudflare registration for nothing.
+ const unusable = new Map();
+ const allIndexes = Array.from({ length: COUNT }, (_, i) => i + 1);
+
+ await runPool(allIndexes, PROBE_CONCURRENCY, async (index) => {
+  const [res] = await probeRelay(index, [targetModel]);
+  if (res.status === 200 && !res.serverError) {
+   cleanIndexes.push(index);
+  } else if (res.status === 429) {
+   throttledIndexes.push(index);
+  } else {
+   unusable.set(index, `${res.status || "unreachable"} ${res.detail}`.slice(0, 120));
+  }
+ });
+
+ let pending = throttledIndexes.sort((a, b) => a - b);
+ log(`baseline: ${cleanIndexes.length}/${COUNT} clean, ${pending.length} rate-limited, ${unusable.size} not resettable`);
+ for (const [index, why] of [...unusable.entries()].sort((a, b) => a[0] - b[0])) {
+  log(`#${index} not an egress rate limit (${why}) — left alone`);
+ }
+ if (pending.length === 0) {
+  log(unusable.size === 0 ? `all relays already clean on ${targetModel}` : `no rate-limited relay to reset on ${targetModel}`);
+  return unusable.size === 0;
+ }
+
+ // ── Targeted Reset Rounds ──
+ // OpenCode's free-tier throttle is scoped to one egress IP, so a relay that
+ // answers 429 is not "quota capped" — it is sitting on a throttled address.
+ // The only fix is a new egress: soft restart first (wg0.conf kept: same keys,
+ // fresh WARP /64, zero Cloudflare registrations), and escalate to a full reset
+ // (delete wg0.conf, new keypair, one registration) when the soft restart fails
+ // to change the address or after SOFT_ROTATIONS_BEFORE_TIER2 soft attempts.
+ // Rotation continues until every relay streams 200 OK or MAX_RESET_ATTEMPTS
+ // runs out; a multi-hour retry-after applies to the address being abandoned,
+ // never to the pool, so it never halts the loop.
+ async function rotateContainer(index, tier, attempt) {
+  const container = containerName(index);
+  return enqueueRestart(async () => {
+   const started = now();
+   if (tier === 2) {
+    log(`#${index} [attempt ${attempt}] full reset (t2) — deleting wg0.conf and restarting ${container}`);
+    await docker(["exec", container, "rm", "-f", "/etc/wireguard/wg0.conf"], 30_000);
+    await docker(["restart", container], 60_000);
+    saveTier2State(index, started);
+   } else {
+    log(`#${index} [attempt ${attempt}] soft restart (t1) — restarting ${container} (wg0.conf kept)`);
+    await docker(["restart", container], 60_000);
+   }
+   return started;
+  });
+ }
+
+ async function waitForFreshIp(index, oldIp) {
+  const oldPrefix = egressPrefix(oldIp);
+  const deadline = Date.now() + READY_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+   await sleep(3000);
+   const ip = await getEgressIp(index);
+   if (ip && egressPrefix(ip) !== oldPrefix) return ip;
+  }
+  return null;
+ }
+
+ const softStreak = new Map();
+ for (let attempt = 1; attempt <= MAX_RESET_ATTEMPTS && pending.length > 0; attempt++) {
+  log(`round ${attempt}/${MAX_RESET_ATTEMPTS}: rotating ${pending.length} rate-limited relay(s)...`);
+  const nextPending = [];
+
+  for (const index of pending) {
+   const oldIp = await getEgressIp(index);
+   const streak = softStreak.get(index) ?? 0;
+   let tier = streak >= SOFT_ROTATIONS_BEFORE_TIER2 ? 2 : 1;
+   if (tier === 2 && poolRegistrationsWithinHour(state, now()).length >= MAX_POOL_REGISTRATIONS_PER_HOUR) {
+    log(`[ceiling] Pool-wide registration ceiling reached (${MAX_POOL_REGISTRATIONS_PER_HOUR}/hour) — #${index} stays on soft restarts this round`);
+    tier = 1;
+   }
+
+   let at = await rotateContainer(index, tier, attempt);
+   let newIp = await waitForFreshIp(index, oldIp);
+
+   // A soft restart that cannot move the egress is exactly the case the full
+   // reset exists for: re-register the device and try again immediately.
+   if (!newIp && tier === 1) {
+    if (poolRegistrationsWithinHour(state, now()).length >= MAX_POOL_REGISTRATIONS_PER_HOUR) {
+     log(`[ceiling] Pool-wide registration ceiling reached (${MAX_POOL_REGISTRATIONS_PER_HOUR}/hour) — #${index} cannot escalate to a full reset this round`);
+    } else {
+     log(`#${index} soft restart kept the same egress — escalating to a full reset (t2)`);
+     tier = 2;
+     at = await rotateContainer(index, tier, attempt);
+     newIp = await waitForFreshIp(index, oldIp);
+    }
+   }
+
+   if (!newIp) {
+    log(`#${index} fresh IP verification failed (same IP or not ready)`);
+    nextPending.push(index);
+    softStreak.set(index, streak + 1);
+    continue;
+   }
+   log(`#${index} fresh IP verified (changed from previous egress)`);
+
+   patchRelay(state, index, {
+    lastRotate: at,
+    consecutiveFailures: 0,
+    dirty: false,
+    pendingVerify: false,
+    // Only a full reset spends a Cloudflare registration; the hourly budget
+    // counts registrations, so a soft restart must not consume one.
+    ...(tier === 2 ? { rotations: [...relayEntry(state, index).rotations, at] } : {}),
+   });
+
+   const [res] = await probeRelay(index, [targetModel]);
+   if (res.status === 200 && !res.serverError) {
+    log(`#${index} got 200 streaming (CLEAN) on ${targetModel}`);
+    softStreak.delete(index);
+   } else if (res.status === 429) {
+    log(
+     `#${index} still 429 on new egress` +
+      (res.retryAfter ? ` (retry-after: ${res.retryAfter}s)` : "") +
+      ` — rotating again for a clean address`,
+    );
+    nextPending.push(index);
+    softStreak.set(index, tier === 1 ? streak + 1 : 0);
+   } else {
+    log(`#${index} now ${res.status || "unreachable"} on new egress (${res.detail}) — not an egress rate limit, no further resets`);
+    unusable.set(index, `${res.status || "unreachable"}`);
+   }
+  }
+
+  pending = nextPending;
+ }
+
+ // ── Summary & Exit ──
+ const totalClean = COUNT - pending.length - unusable.size;
+ log(`smart reset finished: ${totalClean}/${COUNT} relays clean, ${pending.length} still rate-limited, ${unusable.size} not resettable`);
+ if (pending.length === 0 && unusable.size === 0) {
+  log(`success: all relays streaming 200 OK (all clean) on ${targetModel} — reset complete`);
+  return true;
+ }
+ return false;
+}
+
 // Tier-2 spends a Cloudflare registration. One per relay per TIER2_MIN_INTERVAL_S
 // is the budget; the state file keeps a stuck relay from re-spending it on
 // every timer tick.
@@ -749,6 +1162,14 @@ function effectiveCooldown(n) {
 function rotationsWithinHour(entry, at) {
  return entry.rotations.filter((ts) => at - ts < 3_600_000);
 }
+function poolRegistrationsWithinHour(state, at) {
+ let count = 0;
+ for (let i = 1; i <= COUNT; i++) {
+  count += rotationsWithinHour(relayEntry(state, i), at).length;
+ }
+ return { length: count };
+}
+
 
 /**
  * The rotation gate: cooldown, minimum gap between rotations, settle window,
@@ -1257,7 +1678,16 @@ async function pass() {
 }
 
 // ── Entry point ─────────────────────────────────────────────────────
-if (LOOP) {
+if (PROBE_ONLY) {
+ const ok = await probePool();
+ process.exitCode = ok ? 0 : 1;
+} else if (RESET_UNTIL_CLEAN) {
+ const ok = await resetUntilClean();
+ process.exitCode = ok ? 0 : 1;
+} else if (FRESH_IP_SWEEP) {
+ const ok = await freshIpSweep();
+ process.exitCode = ok ? 0 : 1;
+} else if (LOOP) {
  log(`loop mode: pass every ${INTERVAL_S}s (Ctrl-C to stop)`);
  for (; ;) {
   const started = Date.now();
