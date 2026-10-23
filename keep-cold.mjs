@@ -154,17 +154,19 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-const USAGE = `Usage: node keep-cold.mjs [--once|--loop|--probe|--fresh-ip-sweep|--reset-until-clean] [--help]
+const USAGE = `Usage: node keep-cold.mjs [--sweep|--once|--loop|--probe|--fresh-ip-sweep|--reset-until-clean] [--help]
 
-  --once             single pass (the default; what the systemd timer runs)
-  --loop             pass every INTERVAL_S seconds (foreground)
+  --sweep            full-pool scan + rotate every rate-limited relay until clean
+                     (what the systemd timer runs)
+  --once             incremental pass: probe only suspects + audit sample
+  --loop             incremental pass every INTERVAL_S seconds (foreground)
   --probe            read-only per-relay probe report (no rotation, no state writes)
   --fresh-ip-sweep   full-pool tier-2 re-key + fresh IP verification + probe sweep
   --reset-until-clean smart targeted full reset of rate-limited relays until 200 OK
   --help             print this text and exit`;
 
 const argv = process.argv.slice(2);
-const unknownArgs = argv.filter((a) => !["--once", "--loop", "--probe", "--status", "--fresh-ip-sweep", "--reset-until-clean", "--help", "-h"].includes(a));
+const unknownArgs = argv.filter((a) => !["--sweep", "--once", "--loop", "--probe", "--status", "--fresh-ip-sweep", "--reset-until-clean", "--help", "-h"].includes(a));
 if (unknownArgs.length) {
  console.error(`keep-cold: unknown argument(s): ${unknownArgs.join(" ")}`);
  console.error(USAGE);
@@ -177,12 +179,13 @@ if (argv.includes("--help") || argv.includes("-h")) {
 const PROBE_ONLY = argv.includes("--probe") || argv.includes("--status");
 const FRESH_IP_SWEEP = argv.includes("--fresh-ip-sweep");
 const RESET_UNTIL_CLEAN = argv.includes("--reset-until-clean");
+const SWEEP = argv.includes("--sweep");
 const LOOP = argv.includes("--loop");
 const ONCE = argv.includes("--once");
 
-const modeFlags = [ONCE, LOOP, PROBE_ONLY, FRESH_IP_SWEEP, RESET_UNTIL_CLEAN].filter(Boolean);
+const modeFlags = [ONCE, LOOP, PROBE_ONLY, FRESH_IP_SWEEP, RESET_UNTIL_CLEAN, SWEEP].filter(Boolean);
 if (modeFlags.length > 1) {
- console.error("keep-cold: --once, --loop, --probe, --fresh-ip-sweep, and --reset-until-clean are mutually exclusive");
+ console.error("keep-cold: --sweep, --once, --loop, --probe, --fresh-ip-sweep, and --reset-until-clean are mutually exclusive");
  process.exit(2);
 }
 
@@ -407,6 +410,24 @@ const RELAY_BACKOFF_BASE_S = envInt("RELAY_BACKOFF_BASE_S", 300, { min: 1 });
 const RELAY_BACKOFF_MAX_S = envInt("RELAY_BACKOFF_MAX_S", 3600, { min: 1 });
 const RELAY_MAX_ROTATIONS_PER_HOUR = envInt("RELAY_MAX_ROTATIONS_PER_HOUR", 2, { min: 1 });
 const PROBE_AUDIT_SAMPLE = envInt("PROBE_AUDIT_SAMPLE", 2, { min: 0, max: COUNT });
+
+// Safety floor for the full sweep: a pool counts as safe when at least this
+// many relays answer 200 on every probed model. Defaults to half the deployed
+// pool (10 of 20); MIN_CLEAN_COUNT pins an exact number instead.
+const MIN_CLEAN_RATIO = (() => {
+ const raw = process.env.MIN_CLEAN_RATIO;
+ if (raw === undefined) return 0.5;
+ const ratio = Number(raw.trim());
+ if (raw.trim() === "" || !Number.isFinite(ratio) || ratio <= 0 || ratio > 1) {
+  console.error(`keep-cold: MIN_CLEAN_RATIO='${raw}' must be a number in (0, 1]`);
+  process.exit(2);
+ }
+ return ratio;
+})();
+const SAFE_FLOOR = Math.min(
+ envInt("MIN_CLEAN_COUNT", Math.max(1, Math.ceil(COUNT * MIN_CLEAN_RATIO)), { min: 1 }),
+ COUNT,
+);
 const EGRESS_SETTLE_S = envInt("EGRESS_SETTLE_S", 150);
 const ROTATE_SPACING_MS = envInt("ROTATE_SPACING_MS", 4000);
 const LIVE_SIGNALS = envInt("LIVE_SIGNALS", 0, { min: 0, max: 1 }) === 1;
@@ -952,6 +973,218 @@ async function probePool() {
 }
 
 /**
+ * Restart one relay on the requested tier. Tier 1 keeps wg0.conf (same keys,
+ * fresh WARP /64, zero Cloudflare registrations); tier 2 deletes it first and
+ * therefore spends one registration. Serialised through the restart queue so
+ * two stop/starts never overlap.
+ */
+async function rotateContainer(index, tier, attempt) {
+ const container = containerName(index);
+ return enqueueRestart(async () => {
+  const started = now();
+  if (tier === 2) {
+   log(`#${index} [attempt ${attempt}] full reset (t2) — deleting wg0.conf and restarting ${container}`);
+   await docker(["exec", container, "rm", "-f", "/etc/wireguard/wg0.conf"], 30_000);
+   await docker(["restart", container], 60_000);
+   saveTier2State(index, started);
+  } else {
+   log(`#${index} [attempt ${attempt}] soft restart (t1) — restarting ${container} (wg0.conf kept)`);
+   await docker(["restart", container], 60_000);
+  }
+  return started;
+ });
+}
+
+/** Poll the relay's trace endpoint until its /64 differs from `oldIp`. */
+async function waitForFreshIp(index, oldIp) {
+ const oldPrefix = egressPrefix(oldIp);
+ const deadline = Date.now() + READY_TIMEOUT_MS;
+ while (Date.now() < deadline) {
+  await sleep(3000);
+  const ip = await getEgressIp(index);
+  if (ip && egressPrefix(ip) !== oldPrefix) return ip;
+ }
+ return null;
+}
+
+/**
+ * Rotate one relay until it streams 200 on every probed model, or the attempt
+ * cap runs out. Time is never the criterion: a multi-hour retry-after applies
+ * to the address being abandoned, so the loop keeps minting new egresses.
+ * Escalates to a tier-2 re-key when a soft restart cannot move the /64 block,
+ * after `SOFT_ROTATIONS_BEFORE_TIER2` soft attempts, or as soon as the new
+ * address is still throttled with the soft streak exhausted.
+ *
+ * Returns true when the relay ends clean.
+ */
+async function resetRelayUntilClean(index, models, state) {
+ let oldIp = await getEgressIp(index);
+ let streak = 0;
+ for (let attempt = 1; attempt <= MAX_RESET_ATTEMPTS; attempt++) {
+  let tier = streak >= SOFT_ROTATIONS_BEFORE_TIER2 ? 2 : 1;
+  if (tier === 2 && !tier2Allowed(index)) {
+   log(`#${index} [attempt ${attempt}] tier-2 budget for this relay is spent — soft restart instead`);
+   tier = 1;
+  }
+  if (tier === 2 && poolRegistrationsWithinHour(state, now()).length >= MAX_POOL_REGISTRATIONS_PER_HOUR) {
+   log(`[ceiling] pool-wide registration ceiling reached (${MAX_POOL_REGISTRATIONS_PER_HOUR}/hour) — #${index} stays on soft restarts`);
+   tier = 1;
+  }
+
+  let at = await rotateContainer(index, tier, attempt);
+  let newIp = await waitForFreshIp(index, oldIp);
+
+  // A soft restart that cannot move the /64 is exactly what the full reset
+  // exists for: re-register now instead of spending the next attempt.
+  if (!newIp && tier === 1) {
+   const ceilingHit = poolRegistrationsWithinHour(state, now()).length >= MAX_POOL_REGISTRATIONS_PER_HOUR;
+   if (ceilingHit) {
+    log(`[ceiling] pool-wide registration ceiling reached (${MAX_POOL_REGISTRATIONS_PER_HOUR}/hour) — #${index} cannot escalate to a full reset`);
+   } else if (!tier2Allowed(index)) {
+    log(`#${index} tier-2 budget for this relay is spent — cannot escalate this round`);
+   } else {
+    log(`#${index} soft restart kept the same egress — escalating to a full reset (t2)`);
+    tier = 2;
+    at = await rotateContainer(index, tier, attempt);
+    newIp = await waitForFreshIp(index, oldIp);
+   }
+  }
+
+  if (!newIp) {
+   log(`#${index} [attempt ${attempt}] fresh egress not verified (same /64 or not ready) — rotating again`);
+   streak += 1;
+   continue;
+  }
+  oldIp = newIp;
+  patchRelay(state, index, {
+   lastRotate: at,
+   dirty: false,
+   pendingVerify: false,
+   probeAfter: 0,
+   cooldownUntil: 0,
+   consecutiveFailures: 0,
+   last429: { model: "", ts: 0 },
+   // Only a full reset spends a Cloudflare registration; the hourly budget
+   // counts registrations, so a soft restart must not consume one.
+   ...(tier === 2 ? { rotations: [...relayEntry(state, index).rotations, at] } : {}),
+  });
+
+  const results = await probeRelay(index, models);
+  const failing = results.filter((r) => r.status !== 200 || r.serverError);
+  if (failing.length === 0) {
+   patchRelay(state, index, cleanPatch());
+   log(`#${index} clean on all ${models.length} model(s) — egress ${newIp}`);
+   return true;
+  }
+  if (failing.every((r) => r.status === 429)) {
+   log(
+    `#${index} [attempt ${attempt}] still 429 on the new egress` +
+     (failing[0].retryAfter ? ` (retry-after: ${failing[0].retryAfter}s)` : "") +
+     ` — rotating again for a clean address`,
+   );
+   streak += 1;
+   continue;
+  }
+  for (const r of failing) log(`#${index} ${r.model} unexpected ${r.status || "unreachable"} on a fresh egress (${r.detail})`.slice(0, 200));
+  patchRelay(state, index, {
+   dirty: true,
+   lastProbe: now(),
+   pendingVerify: false,
+   probeAfter: now() + RELAY_COOLDOWN_S * 1000,
+   consecutiveFailures: relayEntry(state, index).consecutiveFailures + 1,
+  });
+  return false;
+ }
+ patchRelay(state, index, { dirty: true, lastProbe: now(), probeAfter: now() + RELAY_COOLDOWN_S * 1000 });
+ log(`#${index} still rate-limited after ${MAX_RESET_ATTEMPTS} rotation attempt(s)`);
+ return false;
+}
+
+/**
+ * Full-pool sweep: probe every relay on every model, then rotate each
+ * rate-limited egress until it streams 200 (attempt-capped, never time-capped).
+ * This is what the systemd timer runs.
+ *
+ * Returns true when at least SAFE_FLOOR relays are clean.
+ */
+async function sweep() {
+ const state = loadState();
+ const models = PROBE_MODELS;
+ log(`full sweep: ${COUNT} relay(s) x ${models.length} model(s) via ${RELAY_HOST}:${BASE_PORT + 1}..${BASE_PORT + COUNT}`);
+
+ const results = new Map();
+ await runPool(
+  Array.from({ length: COUNT }, (_, i) => i + 1),
+  PROBE_CONCURRENCY,
+  async (index) => {
+   results.set(index, await probeRelay(index, models));
+  },
+ );
+
+ const all = [...results.values()].flat();
+ const observed429 = countByModel(all, (r) => r.status === 429);
+ // A model throttled on a majority of relays is upstream model quota, not a
+ // bad egress: rotating for it burns restarts and cannot succeed. Explicit
+ // GLOBAL_QUOTA_GUARD still wins when the operator lowers it.
+ const quotaCapped = new Set();
+ for (const [model, n] of observed429) {
+  if (n < GLOBAL_QUOTA_GUARD) continue;
+  quotaCapped.add(model);
+  log(`${model} throttled on ${n}/${COUNT} relays — upstream quota, skipping rotation for it this sweep`);
+ }
+
+ const cleanSet = new Set();
+ const toReset = [];
+ const leftAlone = [];
+ for (const index of [...results.keys()].sort((a, b) => a - b)) {
+  const rows = results.get(index);
+  const failing = rows.filter((r) => r.status !== 200 || r.serverError);
+  if (failing.length === 0) {
+   patchRelay(state, index, cleanPatch());
+   cleanSet.add(index);
+   continue;
+  }
+  const rotatable = failing.filter((r) => r.status === 429 && !quotaCapped.has(r.model));
+  const capped = failing.filter((r) => r.status === 429 && quotaCapped.has(r.model));
+  const other = failing.filter((r) => r.status !== 429);
+  for (const r of other) {
+   log(`#${index} ${r.model} ${r.status || "unreachable"} (${r.detail}) — not an egress rate limit, no reset`.slice(0, 200));
+  }
+  if (other.length || rotatable.length === 0) {
+   patchRelay(state, index, {
+    dirty: true,
+    lastProbe: now(),
+    pendingVerify: false,
+    probeAfter: now() + RELAY_COOLDOWN_S * 1000,
+    consecutiveFailures: relayEntry(state, index).consecutiveFailures + 1,
+   });
+   leftAlone.push(index);
+   if (capped.length) log(`#${index} throttled only on quota-capped models (left alone)`);
+   continue;
+  }
+  log(`#${index} rate limited on ${rotatable.map((r) => r.model).join(", ")} — queued for reset`);
+  toReset.push(index);
+ }
+
+ if (toReset.length) {
+  log(`rotating ${toReset.length} rate-limited relay(s) until clean (attempt cap ${MAX_RESET_ATTEMPTS} per relay, no time cap)...`);
+  await runPool(toReset, ROTATE_CONCURRENCY, async (index) => {
+   if (await resetRelayUntilClean(index, models, state)) cleanSet.add(index);
+  });
+ }
+
+ const cleanCount = cleanSet.size;
+ log(
+  `sweep result: ${cleanCount}/${COUNT} relay(s) clean` +
+   (leftAlone.length ? ` | not rotated: ${leftAlone.map((i) => `#${i}`).join(" ")}` : "") +
+   ` | safe floor ${SAFE_FLOOR}`,
+ );
+ const ok = cleanCount >= SAFE_FLOOR;
+ log(ok ? "pool is safe" : `pool is degraded: ${COUNT - cleanCount} relay(s) not clean (floor ${SAFE_FLOOR})`);
+ return ok;
+}
+
+/**
  * Smart targeted full reset of rate-limited relays until 200 OK.
  */
 async function resetUntilClean() {
@@ -1014,34 +1247,6 @@ async function resetUntilClean() {
  // Rotation continues until every relay streams 200 OK or MAX_RESET_ATTEMPTS
  // runs out; a multi-hour retry-after applies to the address being abandoned,
  // never to the pool, so it never halts the loop.
- async function rotateContainer(index, tier, attempt) {
-  const container = containerName(index);
-  return enqueueRestart(async () => {
-   const started = now();
-   if (tier === 2) {
-    log(`#${index} [attempt ${attempt}] full reset (t2) — deleting wg0.conf and restarting ${container}`);
-    await docker(["exec", container, "rm", "-f", "/etc/wireguard/wg0.conf"], 30_000);
-    await docker(["restart", container], 60_000);
-    saveTier2State(index, started);
-   } else {
-    log(`#${index} [attempt ${attempt}] soft restart (t1) — restarting ${container} (wg0.conf kept)`);
-    await docker(["restart", container], 60_000);
-   }
-   return started;
-  });
- }
-
- async function waitForFreshIp(index, oldIp) {
-  const oldPrefix = egressPrefix(oldIp);
-  const deadline = Date.now() + READY_TIMEOUT_MS;
-  while (Date.now() < deadline) {
-   await sleep(3000);
-   const ip = await getEgressIp(index);
-   if (ip && egressPrefix(ip) !== oldPrefix) return ip;
-  }
-  return null;
- }
-
  const softStreak = new Map();
  for (let attempt = 1; attempt <= MAX_RESET_ATTEMPTS && pending.length > 0; attempt++) {
   log(`round ${attempt}/${MAX_RESET_ATTEMPTS}: rotating ${pending.length} rate-limited relay(s)...`);
@@ -1692,6 +1897,9 @@ async function pass() {
 // ── Entry point ─────────────────────────────────────────────────────
 if (PROBE_ONLY) {
  const ok = await probePool();
+ process.exitCode = ok ? 0 : 1;
+} else if (SWEEP) {
+ const ok = await sweep();
  process.exitCode = ok ? 0 : 1;
 } else if (RESET_UNTIL_CLEAN) {
  const ok = await resetUntilClean();

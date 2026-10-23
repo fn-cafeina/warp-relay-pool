@@ -42,7 +42,10 @@ Or run non-interactively with auto-detected sizing recommendations:
 2. **Hardware Sizing:** Detects VPS RAM and CPU cores, recommends safe relay limits, and defaults to the **5-relay sweet spot**.
 3. **MicroWARP Build:** Builds the ultra-lightweight WireGuard + microsocks engine (~1.8 MiB RAM per relay).
 4. **TryCloudflare Tunnel Wiring:** Automatically exposes each relay on a public HTTPS URL without requiring any Cloudflare account, domain name, or open inbound firewall ports.
-5. **Keep-Cold Service:** Installs and enables the `warp-keep-cold.timer` systemd service to automatically probe and rotate rate-limited egress IPs every 5 minutes.
+5. **Keep-Cold Sweep:** Installs `warp-keep-cold.timer` — a systemd service that scans every relay
+   every 5 minutes (≤ 10 relays) or 15 minutes (> 10 relays). Any relay returning HTTP 429 is
+   restarted onto a fresh `/64` egress and re-probed until it streams again. Pool is "safe" once
+   at least half the relays are clean (10 of 20). No time cap on rotation — just attempt-bounded.
 6. **Client Commands:** Prints ready-to-paste `/freeflow add` commands directly into your terminal.
 
 ---

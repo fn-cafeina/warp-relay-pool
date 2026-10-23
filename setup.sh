@@ -513,6 +513,12 @@ NODE_MAJOR=0
 if [ -n "$NODE_BIN" ]; then
   NODE_MAJOR="$("$NODE_BIN" -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
 fi
+# A full sweep probes every relay and rotates each throttled one until it
+# streams again. At 20 relays a throttled round realistically needs more than
+# 5 minutes, so the timer period is sized to the pool: 5 minutes up to 10
+# relays, 15 minutes above that. flock -n still skips a fire that arrives while
+# the previous sweep is running.
+if [ "${COUNT:-5}" -gt 10 ]; then SWEEP_INTERVAL_MIN=15; else SWEEP_INTERVAL_MIN=5; fi
 if [ -n "$NODE_BIN" ] && [ "$NODE_MAJOR" -lt 18 ]; then
   log_warn "Node.js $("$NODE_BIN" -v) is older than 18; the prober needs >=18. Skipping the timers."
 fi
@@ -543,8 +549,13 @@ if [ -n "$NODE_BIN" ] && [ "$NODE_MAJOR" -ge 18 ] && command -v systemctl >/dev/
         -e "s|^Environment=KEEP_COLD_LOG=.*|Environment=KEEP_COLD_LOG=${CURRENT_DIR}/keep-cold.log|" \
         -e "s|^Environment=COUNT=.*|Environment=COUNT=${COUNT}|" \
         -e "s|^Environment=BASE_PORT=.*|Environment=BASE_PORT=${BASE_PORT:-3000}|" \
-        -e "s|^ExecStart=.*|ExecStart=/usr/bin/flock -n -E 0 /tmp/warp-keep-cold.lock ${NODE_BIN} ${CURRENT_DIR}/keep-cold.mjs --once|" \
+        -e "s|^ExecStart=.*|ExecStart=/usr/bin/flock -n -E 0 /tmp/warp-keep-cold.lock ${NODE_BIN} ${CURRENT_DIR}/keep-cold.mjs --sweep|" \
         systemd/warp-keep-cold.service > "$TMP_KEEP"
+
+    TMP_COLD_TIMER="$(mktemp)"
+    sed -e "s|^OnCalendar=.*|OnCalendar=*:0/${SWEEP_INTERVAL_MIN}|" \
+        -e "s|^Description=.*|Description=Run the WARP keep-cold full sweep every ${SWEEP_INTERVAL_MIN} minutes|" \
+        systemd/warp-keep-cold.timer > "$TMP_COLD_TIMER"
 
     TMP_WATCH="$(mktemp)"
     sed -e "s|^User=.*|User=${CURRENT_USER}|" \
@@ -556,16 +567,16 @@ if [ -n "$NODE_BIN" ] && [ "$NODE_MAJOR" -ge 18 ] && command -v systemctl >/dev/
         systemd/warp-logwatch.service > "$TMP_WATCH"
 
     if run_elevated cp "$TMP_KEEP" /etc/systemd/system/warp-keep-cold.service \
-       && run_elevated cp systemd/warp-keep-cold.timer /etc/systemd/system/warp-keep-cold.timer \
+       && run_elevated cp "$TMP_COLD_TIMER" /etc/systemd/system/warp-keep-cold.timer \
        && run_elevated cp "$TMP_WATCH" /etc/systemd/system/warp-logwatch.service \
        && run_elevated cp systemd/warp-logwatch.timer /etc/systemd/system/warp-logwatch.timer \
        && run_elevated systemctl daemon-reload \
        && run_elevated systemctl enable --now warp-keep-cold.timer warp-logwatch.timer; then
-      log_ok "Keep-cold auto-rotation + logwatch active (5-minute timers)."
+      log_ok "Keep-cold full sweep every ${SWEEP_INTERVAL_MIN} minutes + logwatch active (COUNT=${COUNT})."
     else
-      log_warn "systemd units were not installed; run 'node keep-cold.mjs --once' manually or re-run with sudo."
+      log_warn "systemd units were not installed; run 'node keep-cold.mjs --sweep' manually or re-run with sudo."
     fi
-    rm -f "$TMP_KEEP" "$TMP_WATCH"
+    rm -f "$TMP_KEEP" "$TMP_COLD_TIMER" "$TMP_WATCH"
   fi
 fi
 
@@ -588,8 +599,8 @@ echo "   /freeflow test     -> run an upstream inference test across all relays"
 echo "   /freeflow spread   -> fan parallel subagents across all relays"
 echo ""
 echo "🔄 Rate-Limit Protection:"
-echo "   If any relay encounters an upstream HTTP 429, keep-cold automatically"
-echo "   rotates that container to a fresh egress IP. Your public tunnel URLs"
-echo "   never change!"
+echo "   Every ${SWEEP_INTERVAL_MIN} minutes keep-cold sweeps all ${COUNT} relays. Any relay"
+echo "   answering HTTP 429 is restarted onto a fresh egress /64 and re-probed"
+echo "   until it streams again. Your public tunnel URLs never change!"
 echo "======================================================================="
 echo ""

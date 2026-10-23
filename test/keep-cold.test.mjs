@@ -21,13 +21,13 @@ const REPO_ROOT = path.resolve(import.meta.dirname, "..");
 // 23000-23999, this file takes fresh 64-port blocks from 25000-25999 and never
 // reuses one.
 const PORT_MIN = 25000;
-const PORT_MAX = 25999;
+const PORT_MAX = 26999;
 const PORT_BLOCK = 32;
 // Behaviour scenarios that bind relays: keep this in step with the tests below
 // so the random start always leaves room for every block.
-const SCENARIO_BLOCKS = 36;
+const SCENARIO_BLOCKS = 44;
 let nextBlock = PORT_MIN
- + Math.floor(Math.random() * (PORT_MAX - PORT_MIN + 1 - PORT_BLOCK * SCENARIO_BLOCKS));
+ + Math.floor(Math.random() * Math.max(1, PORT_MAX - PORT_MIN + 1 - PORT_BLOCK * SCENARIO_BLOCKS));
 
 const servers = [];
 const tmpDirs = [];
@@ -941,4 +941,108 @@ test("falls back to default OpenCode free models if discovery endpoint fails", a
   ["--probe"],
  );
  assert.match(r.stdout, /deepseek-v4.1-flash-free/);
+});
+// ── --sweep mode ────────────────────────────────────────────────────
+test("--sweep probes all relays, rotates throttled ones until clean, exits 0 when floor reached", async () => {
+ let attempts = 0;
+ const sc = newScenario({
+  count: 4,
+  throttle: {
+   2: {
+    "model-a": () => {
+     attempts++;
+     return attempts <= 1 ? { status: 429 } : null;
+    },
+   },
+  },
+ });
+ await startRelays(sc);
+ const r = await runOnce(sc, { ROTATE_SPACING_MS: "0", MIN_CLEAN_COUNT: "3" }, ["--sweep"]);
+ assert.equal(r.code, 0, r.stdout + r.stderr);
+ assert.match(r.stdout, /full sweep: 4 relay\(s\)/);
+ assert.equal(touchedRelays(sc).length, 4, "all relays probed");
+ assert.match(r.stdout, /rotating 1 rate-limited relay\(s\)/);
+ assert.match(r.stdout, /soft restart \(t1\)/);
+ assert.match(r.stdout, /clean on all 1 model\(s\)/);
+ assert.match(r.stdout, /pool is safe/);
+});
+
+test("--sweep leaves quota-capped relays alone", async () => {
+ const sc = newScenario({
+  count: 4,
+  throttle: {
+   1: { "model-a": { status: 429 } },
+   2: { "model-a": { status: 429 } },
+   3: { "model-a": { status: 429 } },
+   4: { "model-a": { status: 429 } },
+  },
+ });
+ await startRelays(sc);
+ const r = await runOnce(sc, { GLOBAL_QUOTA_GUARD: "4" }, ["--sweep"]);
+ assert.match(r.stdout, /upstream quota, skipping rotation/);
+ assert.deepEqual(restartLines(sc), [], "quota-capped: no restarts");
+ assert.match(r.stdout, /pool is degraded/);
+});
+
+test("--sweep exits 0 when clean count meets floor even with some still throttled", async () => {
+ const sc = newScenario({
+  count: 4,
+  throttle: {
+   1: { "model-a": { status: 429 } },
+   2: { "model-a": { status: 429 } },
+  },
+ });
+ await startRelays(sc);
+ // MAX_RESET_ATTEMPTS=1, relays stay throttled; floor=2 → 2 clean already OK
+ const r = await runOnce(
+  sc,
+  { ROTATE_SPACING_MS: "0", MAX_RESET_ATTEMPTS: "1", MIN_CLEAN_COUNT: "2" },
+  ["--sweep"],
+ );
+ assert.equal(r.code, 0, r.stdout + r.stderr);
+ assert.match(r.stdout, /sweep result: 2\/4 relay\(s\) clean/);
+ assert.match(r.stdout, /safe floor 2/);
+ assert.match(r.stdout, /pool is safe/);
+});
+
+test("--sweep exits 1 when clean count is below floor", async () => {
+ const sc = newScenario({
+  count: 4,
+  throttle: {
+   1: { "model-a": { status: 429 } },
+   2: { "model-a": { status: 429 } },
+   3: { "model-a": { status: 429 } },
+  },
+ });
+ await startRelays(sc);
+ const r = await runOnce(
+  sc,
+  { ROTATE_SPACING_MS: "0", MAX_RESET_ATTEMPTS: "1", MIN_CLEAN_COUNT: "3" },
+  ["--sweep"],
+ );
+ assert.equal(r.code, 1, r.stdout + r.stderr);
+ assert.match(r.stdout, /pool is degraded/);
+});
+
+test("--sweep escalates to tier-2 when soft restart cannot move the /64", async () => {
+ const sc = newScenario({
+  count: 2,
+  throttle: { 2: { "model-a": { status: 429 } } },
+ });
+ await startRelays(sc);
+ const r = await runOnce(
+  sc,
+  {
+   ROTATE_SPACING_MS: "0",
+   READY_TIMEOUT_MS: "4000",
+   MAX_RESET_ATTEMPTS: "1",
+   FAKE_DOCKER_STICKY_RESTARTS: "1",
+   MIN_CLEAN_COUNT: "2",
+  },
+  ["--sweep"],
+ );
+ assert.equal(r.code, 1, r.stdout + r.stderr);
+ const lines = dockerLines(sc);
+ assert.ok(lines.some((l) => l.includes("rm -f /etc/wireguard/wg0.conf")), "escalated to tier-2");
+ assert.match(r.stdout, /escalating to a full reset/);
 });

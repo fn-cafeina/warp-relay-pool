@@ -2,10 +2,14 @@
 # systemctl daemon-reload && systemctl enable --now warp-keep-cold.timer
 
 [Unit]
-Description=Run the WARP keep-cold relay probe every 5 minutes
+Description=Run the WARP keep-cold full sweep every 5 minutes
 
 [Timer]
 OnBootSec=3min
+# Pool sizing (setup.sh rewrites this line): 5 minutes up to 10 relays,
+# 15 minutes above 10, because one sweep rotates every throttled relay
+# until it streams again. flock -n in the service turns an overlapping
+# fire into a skip, never a second concurrent sweep.
 OnCalendar=*:0/5
 AccuracySec=30s
 Unit=warp-keep-cold.service

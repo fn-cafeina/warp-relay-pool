@@ -1,44 +1,35 @@
 # 04 — Operations: keep-cold
 
-`keep-cold.mjs` runs one pass per timer fire and probes a relay with a real
-streaming inference request per model in `PROBE_MODELS` (chat + responses
-wire paths, official-client fingerprint headers). Probing is demand-driven:
-after a one-time baseline sweep a pass touches only a handful of relays (see
-[Cost control](#cost-control)), and only a relay that actually answered with a
-throttle is restarted — at most once per `RELAY_COOLDOWN_S`. Tunnels and the
-relay app are never touched, so every `<RELAY-N-URL>` survives rotation.
+`keep-cold.mjs` is the **rotation controller** for the relay pool. Every timer
+fire it runs a full sweep: probes every relay with a real streaming inference
+request on each daily model, then continuously rotates any relay that answers
+HTTP 429 until it streams 200 again. Your public tunnel URLs never change —
+only the underlying WARP egress container is restarted.
 
-## Probe / rotate logic
+**Naming:** `server.mjs` is the relay router (the HTTPS reverse-proxy);
+`keep-cold.mjs` is the rotation controller/prober.
 
-- Per-model-per-egress: throttling is per model per `<EGRESS-IP>`, so one
-  model probe misses throttles — hence the multi-model default.
-- `GLOBAL_QUOTA_GUARD` (default `max(8, COUNT - 1)`, i.e. 9 at COUNT=10,
-  capped at `COUNT`): a model 429 on that many relays is upstream quota,
-  not egress — skipped for rotation this pass. The high default matters
-  because recycled egress addresses can come up throttled in batches; a
-  low guard would mistake a bad batch for upstream quota and rotate nothing.
-- Speed ranking is logged (`speed <model>: #N Nms …`) but rotation on speed
-  is disabled (`SLOW_THRESHOLD_MS=0`): single-sample rank proved to be
-  upstream noise. Re-enable only on median-over-N evidence.
+## Default behaviour (timer / `--sweep`)
+
+Every 5 minutes (≤ 10 relays) or 15 minutes (> 10 relays):
+1. Probes **every** relay on every popular free model (`deepseek`, `glm`, `mimo` by default).
+2. Relays answering 200 on all models → marked clean.
+3. Relays answering 429 → restarted onto a fresh `/64` egress and re-probed.
+   Rotation continues until 200 or `MAX_RESET_ATTEMPTS` (attempt cap, no time cap).
+4. Safe-floor verdict: exit 0 when ≥ `SAFE_FLOOR` relays are clean (default half the pool — 10 of 20).
+
 - **Two-Tier Rotation:**
-  - **Tier 1 (Default):** Restarts only the container (`docker restart warp-relay-warp-N`). Keeps the existing WireGuard keys in `/etc/wireguard` but acquires a fresh `/64` egress IP path from Cloudflare without spending an account registration.
-  - **Tier 2 (Fallback):** If a relay remains throttled after Tier 1, clears `/etc/wireguard/wg0.conf` and restarts to force a brand new account registration. It is spent only after **two** failed post-restart verifications (not on the first re-rotation), at most once per relay per `TIER2_MIN_INTERVAL_S`, because a re-key is one Cloudflare registration and a throttled registration crash-loops the container.
-- **Upstream `server_error` Detection:** Scans the first 2 SSE chunks on HTTP 200 responses to catch upstream provider crashes ("The model failed to generate a response"), preventing futile rotation loops during upstream outages.
-- Concurrency: `ROTATE_CONCURRENCY` (default `1`) bounds restarts, and they
-  are additionally serialised at least `ROTATE_SPACING_MS` apart regardless of
-  that value (concurrent WARP restarts can trip Cloudflare registration limits
-  and a slow host disk cannot take two container stop/starts at once).
-  Probing is bounded separately by `PROBE_CONCURRENCY`.
-- Tier-2 budget: at most **one re-key per relay per pass**, and no re-key for
-  the same relay within `TIER2_MIN_INTERVAL_S` (default 1 h), persisted in
-  `TIER2_STATE_FILE` (default `.keep-cold/tier2-state.json`).
+  - **Tier 1 (Default):** `docker restart` with `wg0.conf` kept — same keys, fresh `/64`, zero Cloudflare registrations.
+  - **Tier 2 (Fallback):** Deletes `wg0.conf` and restarts — new keypair, one Cloudflare registration. Escalates when a soft restart cannot move the `/64` block, at most once per relay per `TIER2_MIN_INTERVAL_S`.
+- **Quota guard:** a model throttled on ≥ `GLOBAL_QUOTA_GUARD` relays is upstream quota — rotating would burn restarts for nothing, so those relays are left alone.
+- Concurrency: `ROTATE_CONCURRENCY` (default `1`) serialises restarts; `ROTATE_SPACING_MS` adds a mandatory gap between each.
 
 ```bash
-node keep-cold.mjs --once            # single pass (what the timer runs)
-INTERVAL_S=600 node keep-cold.mjs --loop   # pass every 10 min, foreground
-node keep-cold.mjs --fresh-ip-sweep  # on-demand full reset sweep: wipes wg0.conf, acquires fresh IP, probes FRESH_IP_MODEL
-FRESH_IP_MODEL=model-name node keep-cold.mjs --fresh-ip-sweep
-node keep-cold.mjs --help            # usage (unknown flags exit 2)
+node keep-cold.mjs --sweep             # full sweep (what the timer runs)
+node keep-cold.mjs --once             # incremental pass: suspects + audit sample only
+INTERVAL_S=600 node keep-cold.mjs --loop   # incremental pass every 10 min, foreground
+node keep-cold.mjs --fresh-ip-sweep   # on-demand full reset sweep (wipes wg0.conf)
+node keep-cold.mjs --help             # usage (unknown flags exit 2)
 ```
 
 ### On-demand fresh-IP sweep (`--fresh-ip-sweep`)
@@ -199,7 +190,10 @@ to a baseline sweep, and the exit status is unaffected.
 | `PROBE_MODELS_MODE` | `popular` | Auto-probe filter: `popular` (focuses on daily main models `deepseek`, `glm`, `mimo`) or `all` |
 | `PROBE_MODELS` | Dynamically discovered free models | Free tag models auto-probed from OpenCode `/inference/v1/models` (survives model changes) |
 | `FRESH_IP_MODEL` | First model in `PROBE_MODELS` | Target model probed during `--fresh-ip-sweep` (defaults to `deepseek-v4.1-flash-free`) |
-| `RESPONSES_MODELS` | `dots-studio/dots-3-note-preview:free` | Probed via `PROBE_RESPONSES_PATH`; rest via `PROBE_CHAT_PATH` |
+| `PROBE_MODELS_MODE` | `popular` | Auto-probe filter: `popular` (deepseek, glm, mimo) or `all` |
+| `PROBE_MODELS` | Dynamically discovered free models | Free tag models auto-probed from OpenCode `/inference/v1/models` |
+| `MIN_CLEAN_RATIO` | `0.5` | Fraction of pool that must be clean for `--sweep` to exit 0 (0 < ratio ≤ 1) |
+| `MIN_CLEAN_COUNT` | `ceil(COUNT × MIN_CLEAN_RATIO)` | Exact override for the clean floor (overrides `MIN_CLEAN_RATIO`) |
 | `GLOBAL_QUOTA_GUARD` | `max(8, COUNT - 1)` (= 9 at `COUNT=10`) | 429-on-this-many-relays = upstream quota, skip rotation (capped at `COUNT`; override via env, see `.env.example`) |
 | `SPEED_MODEL` / `SLOW_THRESHOLD_MS` / `SLOW_MAX_ROTATIONS` | `nvidia/nemotron-3.5-lightning:free` / `0` / `2` | Speed rotation, disabled by default (`SLOW_MAX_ROTATIONS` is legacy: no per-pass rotation loop remains) |
 | `RELAY_STATE_FILE` | `.keep-cold/state.json` | Per-relay scheduler state (gitignored; corrupt state degrades to a baseline sweep) |
