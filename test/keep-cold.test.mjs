@@ -978,7 +978,7 @@ test("--sweep leaves quota-capped relays alone", async () => {
   },
  });
  await startRelays(sc);
- const r = await runOnce(sc, { GLOBAL_QUOTA_GUARD: "4" }, ["--sweep"]);
+ const r = await runOnce(sc, { SWEEP_QUOTA_GUARD: "4" }, ["--sweep"]);
  assert.match(r.stdout, /upstream quota, skipping rotation/);
  assert.deepEqual(restartLines(sc), [], "quota-capped: no restarts");
  assert.match(r.stdout, /pool is degraded/);

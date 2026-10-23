@@ -1121,18 +1121,17 @@ async function sweep() {
   },
  );
 
- const all = [...results.values()].flat();
- const observed429 = countByModel(all, (r) => r.status === 429);
- // A model throttled on a majority of relays is upstream model quota, not a
- // bad egress: rotating for it burns restarts and cannot succeed. Explicit
- // GLOBAL_QUOTA_GUARD still wins when the operator lowers it.
+ const SWEEP_QUOTA_GUARD = envInt("SWEEP_QUOTA_GUARD", 0);
  const quotaCapped = new Set();
- for (const [model, n] of observed429) {
-  if (n < GLOBAL_QUOTA_GUARD) continue;
-  quotaCapped.add(model);
-  log(`${model} throttled on ${n}/${COUNT} relays — upstream quota, skipping rotation for it this sweep`);
+ if (SWEEP_QUOTA_GUARD > 0) {
+  const all = [...results.values()].flat();
+  const observed429 = countByModel(all, (r) => r.status === 429);
+  for (const [model, n] of observed429) {
+   if (n < SWEEP_QUOTA_GUARD) continue;
+   quotaCapped.add(model);
+   log(`${model} throttled on ${n}/${COUNT} relays — upstream quota, skipping rotation for it this sweep`);
+  }
  }
-
  const cleanSet = new Set();
  const toReset = [];
  const leftAlone = [];

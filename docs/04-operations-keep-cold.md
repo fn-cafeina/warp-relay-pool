@@ -21,7 +21,7 @@ Every 5 minutes (≤ 10 relays) or 15 minutes (> 10 relays):
 - **Two-Tier Rotation:**
   - **Tier 1 (Default):** `docker restart` with `wg0.conf` kept — same keys, fresh `/64`, zero Cloudflare registrations.
   - **Tier 2 (Fallback):** Deletes `wg0.conf` and restarts — new keypair, one Cloudflare registration. Escalates when a soft restart cannot move the `/64` block, at most once per relay per `TIER2_MIN_INTERVAL_S`.
-- **Quota guard:** a model throttled on ≥ `GLOBAL_QUOTA_GUARD` relays is upstream quota — rotating would burn restarts for nothing, so those relays are left alone.
+- **Egress Rotation in Sweep:** In `--sweep` mode, every relay answering HTTP 429 is treated as having a throttled egress address and rotated until clean (`SWEEP_QUOTA_GUARD=0` by default so pool-wide 429 waves never halt rotation). In incremental `--once` mode, `GLOBAL_QUOTA_GUARD` still prevents rotation if a model is throttled pool-wide.
 - Concurrency: `ROTATE_CONCURRENCY` (default `1`) serialises restarts; `ROTATE_SPACING_MS` adds a mandatory gap between each.
 
 ```bash
