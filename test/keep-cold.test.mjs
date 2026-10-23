@@ -853,7 +853,7 @@ test("--probe reports per-relay status without touching any container", async ()
  assert.equal(fs.existsSync(sc.stateFile), false, "probe mode writes no state");
 });
 
-test("auto-discovers free models from OpenCode when PROBE_MODELS is omitted", async () => {
+test("auto-discovers popular free models (deepseek, glm, mimo) from OpenCode by default", async () => {
  const sc = newScenario({ count: 1 });
  await startRelays(sc);
  const mockPort = takeBlock();
@@ -867,6 +867,7 @@ test("auto-discovers free models from OpenCode when PROBE_MODELS is omitted", as
       { id: "mimo-v2.6-flash-free" },
       { id: "paid-gpt-4o" },
       { id: "jev-1.13-free" },
+      { id: "glm-5.3-flash-free" },
       { id: "nemotron-3.5-lightning-free" },
      ],
     }),
@@ -886,8 +887,46 @@ test("auto-discovers free models from OpenCode when PROBE_MODELS is omitted", as
  assert.equal(r.code, 0, r.stdout + r.stderr);
  assert.match(r.stdout, /auto-discovered 3 free model\(s\) from OpenCode/);
  assert.match(r.stdout, /deepseek-v4.1-flash-free/);
+ assert.match(r.stdout, /glm-5.3-flash-free/);
+ assert.match(r.stdout, /mimo-v2.6-flash-free/);
+ assert.doesNotMatch(r.stdout, /nemotron-3.5-lightning-free/);
  assert.doesNotMatch(r.stdout, /paid-gpt-4o/);
- assert.doesNotMatch(r.stdout, /jev-1.13-free/);
+});
+
+test("auto-discovers all free models when PROBE_MODELS_MODE is set to all", async () => {
+ const sc = newScenario({ count: 1 });
+ await startRelays(sc);
+ const mockPort = takeBlock();
+ const mockServer = http.createServer((req, res) => {
+  if (req.url === "/opencode.ai/inference/v1/models") {
+   res.writeHead(200, { "content-type": "application/json" });
+   res.end(
+    JSON.stringify({
+     data: [
+      { id: "deepseek-v4.1-flash-free" },
+      { id: "mimo-v2.6-flash-free" },
+      { id: "paid-gpt-4o" },
+      { id: "glm-5.3-flash-free" },
+      { id: "nemotron-3.5-lightning-free" },
+     ],
+    }),
+   );
+   return;
+  }
+  res.writeHead(200, { "content-type": "text/event-stream" });
+  res.end("data: {}\\n\\n");
+ });
+ servers.push(mockServer);
+ await new Promise((resolve) => mockServer.listen(mockPort, "127.0.0.1", resolve));
+
+ const r = await runOnce(sc, {
+  PROBE_TARGET: `http://127.0.0.1:${mockPort}/opencode.ai`,
+  PROBE_MODELS: undefined,
+  PROBE_MODELS_MODE: "all",
+ });
+ assert.equal(r.code, 0, r.stdout + r.stderr);
+ assert.match(r.stdout, /auto-discovered 4 free model\(s\) from OpenCode/);
+ assert.match(r.stdout, /nemotron-3.5-lightning-free/);
 });
 
 test("falls back to default OpenCode free models if discovery endpoint fails", async () => {

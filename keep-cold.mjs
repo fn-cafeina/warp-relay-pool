@@ -291,13 +291,19 @@ const PROBE_TARGET = envUrl("PROBE_TARGET", "https://opencode.ai");
 const PROBE_CHAT_PATH = envPath("PROBE_CHAT_PATH", "/inference/v1/chat/completions");
 const PROBE_RESPONSES_PATH = envPath("PROBE_RESPONSES_PATH", "/inference/v1/responses");
 
-const DEFAULT_FALLBACK_OPENCODE_FREE_MODELS = [
- "deepseek-v4.1-flash-free",
- "mimo-v2.6-flash-free",
- "nemotron-3.5-lightning-free",
- "glm-5.3-flash-free",
+const PROBE_MODELS_MODE = (process.env.PROBE_MODELS_MODE ?? "popular").trim().toLowerCase();
+
+const POPULAR_MODEL_PATTERNS = [
+ /deepseek.*free/i,
+ /glm.*free/i,
+ /mimo.*free/i,
 ];
 
+const DEFAULT_FALLBACK_OPENCODE_FREE_MODELS = [
+ "deepseek-v4.1-flash-free",
+ "glm-5.3-flash-free",
+ "mimo-v2.6-flash-free",
+];
 const EXCLUDE_PROBE_MODELS = new Set([
  "jev-1.13-free", // non-chat decision model, 400s on chat
  "deepseek-v4-flash-free", // unserved upstream (400 unavailable)
@@ -331,6 +337,12 @@ async function discoverOpenCodeFreeModels(targetUrl) {
      if (b === "deepseek-v4.1-flash-free") return 1;
      return a.localeCompare(b);
     });
+    if (PROBE_MODELS_MODE === "popular") {
+     const popular = freeIds.filter((id) => POPULAR_MODEL_PATTERNS.some((re) => re.test(id)));
+     if (popular.length > 0) {
+      return popular;
+     }
+    }
     return freeIds;
    }
   }

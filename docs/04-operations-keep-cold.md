@@ -196,6 +196,7 @@ to a baseline sweep, and the exit status is unaffected.
 | `COUNT` | `10` | Relays probed |
 | `PROBE_TARGET` | `https://opencode.ai` | Upstream the probes go through (defaults to OpenCode Zen inference with official fingerprint) |
 | `PROBE_CHAT_PATH` / `PROBE_RESPONSES_PATH` | `/inference/v1/chat/completions` / `/inference/v1/responses` | Wire paths under `PROBE_TARGET` |
+| `PROBE_MODELS_MODE` | `popular` | Auto-probe filter: `popular` (focuses on daily main models `deepseek`, `glm`, `mimo`) or `all` |
 | `PROBE_MODELS` | Dynamically discovered free models | Free tag models auto-probed from OpenCode `/inference/v1/models` (survives model changes) |
 | `FRESH_IP_MODEL` | First model in `PROBE_MODELS` | Target model probed during `--fresh-ip-sweep` (defaults to `deepseek-v4.1-flash-free`) |
 | `RESPONSES_MODELS` | `dots-studio/dots-3-note-preview:free` | Probed via `PROBE_RESPONSES_PATH`; rest via `PROBE_CHAT_PATH` |
