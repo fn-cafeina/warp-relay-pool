@@ -18,7 +18,7 @@ FROM alpine:3.21
 # wireguard-tools: wg-quick + wg
 # iptables: both iptables and ip6tables on Alpine
 # iproute2: ip rule/route for policy routing
-# curl + ca-certificates: wgcf bootstrap + HTTPS trace probes
+# curl + ca-certificates: direct Cloudflare WARP API bootstrap + HTTPS trace probes
 # openresolv: satisfies resolvconf calls from wg-quick code paths
 RUN apk add --no-cache \
     wireguard-tools \

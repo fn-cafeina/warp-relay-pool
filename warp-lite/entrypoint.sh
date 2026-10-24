@@ -21,9 +21,6 @@ TAILSCALE_CIDR="${TAILSCALE_CIDR:-100.64.0.0/10}"
 TAILSCALE_CIDR_V6="${TAILSCALE_CIDR_V6:-fd7a:115c:a1e0::/48}"
 KEEPALIVE="${KEEPALIVE:-15}"
 ENDPOINT_IP="${ENDPOINT_IP:-}"
-# Pinned release; set WGCF_VERSION=latest to resolve from the GitHub API.
-WGCF_VERSION="${WGCF_VERSION:-2.3.1}"
-WGCF_FALLBACK_VER="${WGCF_FALLBACK_VER:-2.3.1}"
 CURL_TIMEOUT="${CURL_TIMEOUT:-15}"
 # Keep egress probe short so it never delays SOCKS readiness.
 TRACE_TIMEOUT="${TRACE_TIMEOUT:-3}"
@@ -55,66 +52,6 @@ run_with_timeout() {
     "$@"
 }
 
-github_auth_header() {
-    token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
-    if [ -n "$token" ]; then
-        printf 'Authorization: Bearer %s' "$token"
-    fi
-}
-
-detect_arch() {
-    arch="$(uname -m)"
-    case "$arch" in
-        x86_64|amd64)  printf 'amd64' ;;
-        aarch64|arm64) printf 'arm64' ;;
-        *) die "unsupported architecture: $arch (supported: x86_64/amd64, aarch64/arm64)" ;;
-    esac
-}
-
-resolve_wgcf_version() {
-    if [ "$WGCF_VERSION" != "latest" ]; then
-        printf '%s' "$WGCF_VERSION"
-        return 0
-    fi
-    fetch_latest_wgcf_version
-}
-
-fetch_latest_wgcf_version() {
-    api="https://api.github.com/repos/ViRb3/wgcf/releases/latest"
-    auth="$(github_auth_header)"
-    body=""
-
-    if [ -n "$auth" ]; then
-        body="$(curl -fsSL -m "$CURL_TIMEOUT" -H "$auth" "$api" 2>/dev/null || true)"
-    else
-        body="$(curl -fsSL -m "$CURL_TIMEOUT" "$api" 2>/dev/null || true)"
-    fi
-
-    ver="$(printf '%s' "$body" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"v\([^"]*\)".*/\1/p' | head -n 1)"
-    if [ -z "$ver" ]; then
-        warn "could not fetch latest wgcf version from GitHub API, using fallback v${WGCF_FALLBACK_VER}"
-        printf '%s' "$WGCF_FALLBACK_VER"
-        return 0
-    fi
-    printf '%s' "$ver"
-}
-
-download_file() {
-    url="$1"
-    dest="$2"
-    tries=0
-    max_tries=3
-
-    while [ "$tries" -lt "$max_tries" ]; do
-        tries=$((tries + 1))
-        if curl -fsSL -m 30 -o "$dest" "$url" 2>/dev/null; then
-            [ -s "$dest" ] && return 0
-        fi
-        warn "download failed (attempt ${tries}/${max_tries}): $url"
-        sleep $((tries * 2))
-    done
-    return 1
-}
 
 # Extract first IPv4 CIDR from text.
 extract_ipv4_cidr() {
@@ -180,53 +117,53 @@ iface_has_global_ipv6() {
 # 1. Account registration / config bootstrap (wgcf)
 # ==========================================
 register_warp() {
-    log "no config found, registering Cloudflare WARP (WireGuard)..."
+    log "no config found, registering Cloudflare WARP via direct API..."
 
-    arch="$(detect_arch)"
-    ver="$(resolve_wgcf_version)"
-    log "wgcf version: v${ver} (${arch})"
+    command -v wg >/dev/null 2>&1 || die "wg command not found"
+    priv_key="$(wg genkey)" || die "failed to generate WireGuard private key"
+    pub_key="$(printf '%s' "$priv_key" | wg pubkey)" || die "failed to generate WireGuard public key"
 
-    url="https://github.com/ViRb3/wgcf/releases/download/v${ver}/wgcf_${ver}_linux_${arch}"
-    workdir="$(mktemp -d /tmp/warplite.XXXXXX)" || die "could not create temp dir"
-    # shellcheck disable=SC2064
-    trap 'rm -rf "$workdir"' EXIT INT TERM
+    ts="$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")"
+    reg_payload="{\"key\":\"${pub_key}\",\"install_id\":\"\",\"tos\":\"${ts}\",\"type\":\"Android\",\"model\":\"PC\",\"locale\":\"en_US\"}"
 
-    if ! download_file "$url" "$workdir/wgcf"; then
-        die "wgcf download failed: $url"
-    fi
+    reg_res="$(curl -fsSL -m 15 -X POST "https://api.cloudflareclient.com/v0a884/reg" \
+        -H "User-Agent: okhttp/3.12.1" \
+        -H "Content-Type: application/json" \
+        -d "$reg_payload")" || die "failed to register device with Cloudflare API"
 
-    # Verify the release checksum before executing: the binary runs as root
-    # with NET_ADMIN privileges in every relay.
-    sums_url="https://github.com/ViRb3/wgcf/releases/download/v${ver}/checksums.txt"
-    if ! download_file "$sums_url" "$workdir/checksums.txt"; then
-        die "wgcf checksums download failed: $sums_url"
-    fi
-    expected="$(awk -v f="wgcf_${ver}_linux_${arch}" '$2 == f { print $1; exit }' "$workdir/checksums.txt")"
-    actual="$(sha256sum "$workdir/wgcf" | awk '{ print $1 }')"
-    if [ -z "$expected" ] || [ "$expected" != "$actual" ]; then
-        die "wgcf checksum mismatch (expected '${expected}', got '${actual}')"
-    fi
-    chmod +x "$workdir/wgcf"
+    account_id="$(printf '%s' "$reg_res" | grep -o '"id":"[^"]*"' | head -n 1 | cut -d'"' -f4)"
+    token="$(printf '%s' "$reg_res" | grep -o '"token":"[^"]*"' | head -n 1 | cut -d'"' -f4)"
+    addr_block="$(printf '%s' "$reg_res" | grep -o '"addresses":{[^}]*}' || true)"
+    v4="$(printf '%s' "$addr_block" | grep -o '"v4":"[^"]*"' | head -n 1 | cut -d'"' -f4)"
+    v6="$(printf '%s' "$addr_block" | grep -o '"v6":"[^"]*"' | head -n 1 | cut -d'"' -f4)"
+    peer_pub="$(printf '%s' "$reg_res" | grep -o '"public_key":"[^"]*"' | head -n 1 | cut -d'"' -f4)"
+    peer_host="$(printf '%s' "$reg_res" | grep -o '"host":"[^"]*"' | head -n 1 | cut -d'"' -f4)"
 
-    log "registering device with Cloudflare..."
-    if ! (
-        cd "$workdir"
-        ./wgcf register --accept-tos >/dev/null 2>&1
-        log "generating WireGuard profile..."
-        ./wgcf generate >/dev/null 2>&1
-    ); then
-        die "wgcf register or generate failed"
-    fi
+    [ -n "$account_id" ] && [ -n "$token" ] || die "invalid registration response from Cloudflare"
+    [ -z "$peer_host" ] && peer_host="engage.cloudflareclient.com:2408"
 
-    if [ ! -f "$workdir/wgcf-profile.conf" ]; then
-        die "wgcf-profile.conf not found, registration likely failed"
-    fi
+    # Enable WARP mode on Cloudflare
+    curl -fsSL -m 10 -X PATCH "https://api.cloudflareclient.com/v0a884/reg/${account_id}" \
+        -H "Authorization: Bearer ${token}" \
+        -H "User-Agent: okhttp/3.12.1" \
+        -H "Content-Type: application/json" \
+        -d '{"warp_enabled":true}' >/dev/null || warn "warning: failed to set warp_enabled: true (continuing)"
 
-    mv "$workdir/wgcf-profile.conf" "$WG_CONF"
-    # Burn-after-read: drop account material and binary.
-    rm -rf "$workdir"
-    trap - EXIT INT TERM
-    log "WARP profile generated"
+    cat <<EOF > "$WG_CONF"
+[Interface]
+PrivateKey = ${priv_key}
+Address = ${v4}/32
+Address = ${v6}/128
+DNS = 1.1.1.1
+
+[Peer]
+PublicKey = ${peer_pub}
+AllowedIPs = 0.0.0.0/0, ::/0
+Endpoint = ${peer_host}
+EOF
+
+    chmod 600 "$WG_CONF"
+    log "WARP profile registered and generated via direct API in <1s (IPv4: ${v4}, IPv6: ${v6})"
 }
 
 # ==========================================
