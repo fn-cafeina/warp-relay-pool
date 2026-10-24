@@ -399,7 +399,7 @@ const SERVER_ERROR_RETRY = envInt("SERVER_ERROR_RETRY", 1);
 const SERVER_ERROR_REPROBE_MS = envInt("SERVER_ERROR_REPROBE_MS", 5_000);
 const SERVER_ERROR_GUARD = Math.min(envInt("SERVER_ERROR_GUARD", 9, { min: 1 }), COUNT);
 const INTERVAL_S = envInt("INTERVAL_S", 300, { min: 1 });
-const TIER2_MIN_INTERVAL_S = envInt("TIER2_MIN_INTERVAL_S", 3600);
+const TIER2_MIN_INTERVAL_S = envInt("TIER2_MIN_INTERVAL_S", 60);
 
 // ── Demand-driven scheduling knobs ──────────────────────────────────
 const RELAY_STATE_FILE = envFile("RELAY_STATE_FILE", ".keep-cold/state.json");
@@ -837,7 +837,10 @@ async function getEgressIp(index) {
  * rotation that only moves the suffix has changed nothing.
  */
 function egressPrefix(ip) {
- const [head, tail = ""] = String(ip).split("::");
+ if (!ip) return "";
+ const s = String(ip).trim();
+ if (!s.includes(":")) return s;
+ const [head, tail = ""] = s.split("::");
  const headParts = head ? head.split(":") : [];
  const tailParts = tail ? tail.split(":") : [];
  const missing = Math.max(0, 8 - headParts.length - tailParts.length);
