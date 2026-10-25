@@ -94,7 +94,7 @@ CONT_HI=$((BASE_PORT + COUNT))
 # warp-N:1080 over the bridge and all shipped tooling probes 127.0.0.1, so
 # only deliberate exposure needs WARP_BIND / INGRESS_BIND.
 SOCKS_BIND="${WARP_BIND:-127.0.0.1}"
-ROUTER_BIND="${INGRESS_BIND:-127.0.0.1}"
+ROUTER_BIND="${INGRESS_BIND:-0.0.0.0}"
 # IPv6 binds would need Compose's bracketed port syntax ("[::]:port:port"),
 # which the templates below do not emit — reject rather than write a file
 # Docker cannot parse.
@@ -131,10 +131,26 @@ networks:
 services:
 HEADER
 
+get_endpoint_for_index() {
+  case "$(( ($1 - 1) % 10 ))" in
+    0) echo "162.159.192.1:2408" ;;
+    1) echo "162.159.193.1:2408" ;;
+    2) echo "162.159.195.1:2408" ;;
+    3) echo "188.114.96.1:2408" ;;
+    4) echo "188.114.97.1:2408" ;;
+    5) echo "188.114.98.1:2408" ;;
+    6) echo "188.114.99.1:2408" ;;
+    7) echo "162.159.192.2:2408" ;;
+    8) echo "162.159.193.2:2408" ;;
+    9) echo "162.159.195.2:2408" ;;
+  esac
+}
+
 if [ "$USE_LITE" = true ]; then
 i=1
 while [ "$i" -le "$COUNT" ]; do
 WARP_PORT=$((10800 + i))
+ENDPOINT_FOR_RELAY="$(get_endpoint_for_index "$i")"
 cat <<ENTRY
   warp-${i}:
     image: warp-lite:latest
@@ -149,6 +165,7 @@ cat <<ENTRY
       - net.ipv6.conf.all.forwarding=1
     environment:
       - ALLOW_NO_AUTH=1
+      - ENDPOINT_IP=${ENDPOINT_FOR_RELAY}
     volumes:
       - warp-data-${i}:/etc/wireguard
     mem_limit: 32M
@@ -168,6 +185,7 @@ else
 i=1
 while [ "$i" -le "$COUNT" ]; do
 WARP_PORT=$((10800 + i))
+ENDPOINT_FOR_RELAY="$(get_endpoint_for_index "$i")"
 cat <<ENTRY
   warp-${i}:
     image: caomingjun/warp:latest
@@ -177,6 +195,8 @@ cat <<ENTRY
       - NET_ADMIN
     sysctls:
       - net.ipv6.conf.all.disable_ipv6=0
+    environment:
+      - ENDPOINT_IP=${ENDPOINT_FOR_RELAY}
     logging:
       driver: json-file
       options:
