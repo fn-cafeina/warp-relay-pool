@@ -99,6 +99,7 @@ if (args[0] === "restart") {
   stateFile: path.join(dir, "state.json"),
   signalFile: path.join(dir, "signals.json"),
   tier2File: path.join(dir, "tier2.json"),
+  blacklistFile: path.join(dir, "blacklist.json"),
   dockerLog: path.join(dir, "docker.log"),
   fakeDocker,
   throttles,
@@ -156,6 +157,7 @@ function baseEnv(sc) {
   RELAY_STATE_FILE: sc.stateFile,
   LIVE_SIGNAL_FILE: sc.signalFile,
   TIER2_STATE_FILE: sc.tier2File,
+  PREFIX_BLACKLIST_FILE: sc.blacklistFile,
   LIVE_SIGNALS: "0",
   KEEP_COLD_LOG: "",
   DOCKER_BIN: process.execPath,
@@ -836,6 +838,25 @@ test("--reset-until-clean ceiling blocks tier-2 escalation but soft restarts con
  assert.equal(restartLines(sc).length, 6, "all three relays still rotated on both rounds");
  assert.match(r.stdout, /\[ceiling\]/);
 });
+test("--reset-until-clean skips probing when fresh IP is in throttled prefix blacklist cache", async () => {
+ const sc = newScenario({
+  count: 1,
+  throttle: { 1: { "model-a": { status: 429 } } },
+ });
+ // Pre-seed blacklist with the prefix that the fake docker returns on attempt 1 (2a09:2:1:0)
+ fs.writeFileSync(
+  sc.blacklistFile,
+  JSON.stringify({ "2a09:2:1:0": Date.now() + 3600_000 }),
+ );
+ await startRelays(sc);
+ const r = await runOnce(
+  sc,
+  { ROTATE_SPACING_MS: "0", MAX_RESET_ATTEMPTS: "2", TARGET_MODEL: "model-a" },
+  ["--reset-until-clean"],
+ );
+ assert.match(r.stdout, /in blacklist cache/);
+});
+
 
 
 test("--probe reports per-relay status without touching any container", async () => {

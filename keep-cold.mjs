@@ -405,6 +405,7 @@ const TIER2_MIN_INTERVAL_S = envInt("TIER2_MIN_INTERVAL_S", 60);
 const RELAY_STATE_FILE = envFile("RELAY_STATE_FILE", ".keep-cold/state.json");
 const LIVE_SIGNAL_FILE = envFile("LIVE_SIGNAL_FILE", ".keep-cold/signals.json");
 const TIER2_STATE_FILE = envFile("TIER2_STATE_FILE", ".keep-cold/tier2-state.json");
+const PREFIX_BLACKLIST_FILE = envFile("PREFIX_BLACKLIST_FILE", ".keep-cold/throttled-prefixes.json");
 const RELAY_COOLDOWN_S = envInt("RELAY_COOLDOWN_S", 600);
 const RELAY_BACKOFF_BASE_S = envInt("RELAY_BACKOFF_BASE_S", 300, { min: 1 });
 const RELAY_BACKOFF_MAX_S = envInt("RELAY_BACKOFF_MAX_S", 3600, { min: 1 });
@@ -847,6 +848,39 @@ function egressPrefix(ip) {
  const full = [...headParts, ...Array(missing).fill("0"), ...tailParts];
  return full.slice(0, 4).join(":");
 }
+function loadThrottledPrefixes(file = PREFIX_BLACKLIST_FILE) {
+ try {
+  const raw = fs.readFileSync(file, "utf8");
+  const data = JSON.parse(raw);
+  const nowMs = now();
+  const cleaned = {};
+  for (const [pfx, exp] of Object.entries(data)) {
+   if (Number(exp) > nowMs) cleaned[pfx] = Number(exp);
+  }
+  return cleaned;
+ } catch {
+  return {};
+ }
+}
+
+function rememberThrottledPrefix(prefix, retryAfterS = 3600, file = PREFIX_BLACKLIST_FILE) {
+ if (!prefix) return;
+ const map = loadThrottledPrefixes(file);
+ const exp = now() + (parseInt(retryAfterS, 10) || 3600) * 1000;
+ map[prefix] = exp;
+ try {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(map, null, 2), "utf8");
+ } catch {}
+}
+
+function isPrefixThrottled(prefix, file = PREFIX_BLACKLIST_FILE) {
+ if (!prefix) return false;
+ const map = loadThrottledPrefixes(file);
+ const exp = Number(map[prefix] ?? 0);
+ return exp > now();
+}
+
 
 /**
  * --fresh-ip-sweep: serial full reset (tier-2) of every relay in the pool,
@@ -1059,6 +1093,12 @@ async function resetRelayUntilClean(index, models, state) {
    continue;
   }
   oldIp = newIp;
+  const pfx = egressPrefix(newIp);
+  if (isPrefixThrottled(pfx)) {
+   log(`#${index} [attempt ${attempt}] prefix ${pfx} is in blacklist cache (throttled) — skipping probe and re-rolling`);
+   streak += 1;
+   continue;
+  }
   patchRelay(state, index, {
    lastRotate: at,
    dirty: false,
@@ -1080,6 +1120,7 @@ async function resetRelayUntilClean(index, models, state) {
    return true;
   }
   if (failing.every((r) => r.status === 429)) {
+   rememberThrottledPrefix(pfx, failing[0].retryAfter || 3600);
    log(
     `#${index} [attempt ${attempt}] still 429 on the new egress` +
      (failing[0].retryAfter ? ` (retry-after: ${failing[0].retryAfter}s)` : "") +
@@ -1286,6 +1327,13 @@ async function resetUntilClean() {
     continue;
    }
    log(`#${index} fresh IP verified (changed from previous egress)`);
+   const pfx = egressPrefix(newIp);
+   if (isPrefixThrottled(pfx)) {
+    log(`#${index} [attempt ${attempt}] prefix ${pfx} is in blacklist cache (throttled) — skipping probe and re-rolling`);
+    nextPending.push(index);
+    softStreak.set(index, streak + 1);
+    continue;
+   }
 
    patchRelay(state, index, {
     lastRotate: at,
@@ -1302,8 +1350,8 @@ async function resetUntilClean() {
     log(`#${index} got 200 streaming (CLEAN) on ${targetModel}`);
     softStreak.delete(index);
    } else if (res.status === 429) {
+    rememberThrottledPrefix(pfx, res.retryAfter || 3600);
     log(
-     `#${index} still 429 on new egress` +
       (res.retryAfter ? ` (retry-after: ${res.retryAfter}s)` : "") +
       ` — rotating again for a clean address`,
     );
