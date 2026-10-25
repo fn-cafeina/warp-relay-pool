@@ -1,5 +1,5 @@
-# The relay image needs only package.json, package-lock.json, server.mjs and
-# signal-writer.mjs.
+# The relay image needs only server.mjs and signal-writer.mjs; Bun and its
+# standard library come from the pinned base image.
 # Keep the whole checkout (including .env and WARP account material) out of
 # the build context.
 .git

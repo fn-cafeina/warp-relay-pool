@@ -25,7 +25,7 @@ const PORT_MAX = 26999;
 const PORT_BLOCK = 32;
 // Behaviour scenarios that bind relays: keep this in step with the tests below
 // so the random start always leaves room for every block.
-const SCENARIO_BLOCKS = 44;
+const SCENARIO_BLOCKS = 45;
 let nextBlock = PORT_MIN
  + Math.floor(Math.random() * Math.max(1, PORT_MAX - PORT_MIN + 1 - PORT_BLOCK * SCENARIO_BLOCKS));
 
@@ -118,7 +118,15 @@ function startRelay(port, logFile, throttle) {
     } catch {
      model = "";
     }
-    fs.appendFileSync(logFile, `${JSON.stringify({ model })}\n`);
+    fs.appendFileSync(
+     logFile,
+     `${JSON.stringify({
+      model,
+      at: Date.now(),
+      session: req.headers["x-opencode-session"] ?? "",
+      body,
+     })}\n`,
+    );
     const rawSpec = throttle.get(model);
     const spec = typeof rawSpec === "function" ? rawSpec() : rawSpec;
     if (spec) {
@@ -302,6 +310,49 @@ test("audit sample cannot exceed COUNT", async () => {
  const r = await runOnce(sc, { PROBE_AUDIT_SAMPLE: "3" });
  assert.equal(r.code, 2);
  assert.match(r.stderr, /PROBE_AUDIT_SAMPLE/);
+});
+
+// ── probe fingerprint ───────────────────────────────────────────────
+test("probe bodies carry the env block and a timestamp session id", async () => {
+ const sc = newScenario({ count: 1 });
+ await startRelays(sc);
+ const r = await runOnce(sc, {
+  PROBE_MODELS: "model-a,model-b",
+  RESPONSES_MODELS: "model-b",
+ });
+ assert.equal(r.code, 0, r.stdout + r.stderr);
+
+ const rows = fs.readFileSync(path.join(sc.dir, "relay-1.log"), "utf8")
+  .split("\n")
+  .filter(Boolean)
+  .map((line) => JSON.parse(line));
+ assert.equal(rows.length, 2);
+
+ let sawChat = false;
+ let sawResponses = false;
+ for (const row of rows) {
+  assert.match(row.session, /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/);
+  const inverted = (~BigInt(`0x${row.session.slice(4, 16)}`)) & 0xffffffffffffn;
+  const sessionMs = BigInt(inverted / 0x1000n);
+  // The 12 hex characters encode only the low 36 bits of the millisecond
+  // timestamp (the counter occupies the low 12 bits), so compare modulo 2^36.
+  const period = 1n << 36n;
+  const expectedMs = BigInt(row.at) % period;
+  const delta = (sessionMs - expectedMs + period) % period;
+  assert.ok(delta < 5_000n || period - delta < 5_000n, `session timestamp ${sessionMs} vs ${row.at}`);
+
+  const body = JSON.parse(row.body);
+  if (Array.isArray(body.messages)) {
+   sawChat = true;
+   assert.equal(body.messages[0].role, "system");
+   assert.match(body.messages[0].content, /<env>\n  Working directory: [^\n]+\n<\/env>/);
+  } else {
+   sawResponses = true;
+   assert.match(body.instructions, /<env>\n  Working directory: [^\n]+\n<\/env>/);
+  }
+ }
+ assert.equal(sawChat, true, "chat probe body missing");
+ assert.equal(sawResponses, true, "responses probe body missing");
 });
 
 // ── case 1 + 10: a healthy pool costs the audit sample only ──────────

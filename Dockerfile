@@ -1,11 +1,11 @@
-FROM node:22-alpine
+FROM oven/bun:1.4.3-alpine
 WORKDIR /app
-# Lockfile-pinned install: the relay is the network boundary, so two builds of
-# the same commit must resolve the same undici.
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+# Only Bun's native fetch reaches the upstream with the client fingerprint the
+# free-tier gate expects; there are no npm dependencies to install. The exact
+# image tag is intentionally pinned so a rebuild cannot silently change the
+# transport that every relay depends on.
 COPY server.mjs signal-writer.mjs ./
 EXPOSE 3000-3064
 # No privileged ports or filesystem writes.
-USER node
-CMD ["node", "server.mjs"]
+USER bun
+CMD ["bun", "server.mjs"]

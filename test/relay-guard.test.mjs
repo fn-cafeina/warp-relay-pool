@@ -21,6 +21,7 @@ import path from "node:path";
 
 const CONNECTS = [];
 const REPO_ROOT = path.resolve(import.meta.dirname, "..");
+const BUN_BIN = process.env.BUN_BIN || "bun";
 // Disjoint from keep-cold.test.mjs (25000-25999) so parallel test files cannot
 // bind each other's relay port.
 const BASE_PORT = 23000 + Math.floor(Math.random() * 1000);
@@ -194,7 +195,7 @@ async function hit(relayPath, { target = "https://opencode.ai" } = {}) {
 before(async () => {
   sink = await startSink();
   const sinkPort = sink.address().port;
-  child = spawn(process.execPath, ["server.mjs"], {
+  child = spawn(BUN_BIN, ["server.mjs"], {
     cwd: REPO_ROOT,
     env: {
       ...process.env,
@@ -222,6 +223,12 @@ before(async () => {
   // Success-path stack: local upstream (echo) + a forwarding SOCKS server +
   // a second relay instance allowlisted to that upstream.
   upstream = await startUpstream((req, res, body) => {
+    if (req.url.startsWith("/stream")) {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      res.write("data: one\n\n");
+      setTimeout(() => res.end("data: two\n\n"), 25);
+      return;
+    }
     if (req.url.startsWith("/redirect")) {
       res.writeHead(302, { location: `http://127.0.0.1:${secondUpstream.address().port}/secret` });
       res.end();
@@ -243,7 +250,7 @@ before(async () => {
   forwarder = await startForwarder();
   signalDir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-signals-"));
   signalFile = path.join(signalDir, "signals.json");
-  relay2 = spawn(process.execPath, ["server.mjs"], {
+  relay2 = spawn(BUN_BIN, ["server.mjs"], {
     cwd: REPO_ROOT,
     env: {
       ...process.env,
@@ -392,6 +399,13 @@ test("Expect: 100-continue upload is forwarded instead of 502", async () => {
   });
   assert.equal(res.status, 200);
   assert.equal(JSON.parse(res.body).body, '{"expect":true}');
+});
+
+test("SSE response streams through the relay", async () => {
+  const res = await hitSecond("/stream");
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("content-type"), "text/event-stream");
+  assert.equal(await res.text(), "data: one\n\ndata: two\n\n");
 });
 
 test("upstream redirects are not followed", async () => {

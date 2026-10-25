@@ -7,9 +7,10 @@ creates — the OMP/Pi extension (npm `pi-freeflow`): same
 (`https://opencode.ai`, `https://api.kilo.ai`). Client-side failover lives
 there — see its [relays.md failover table](https://github.com/trefeon/pi-freeflow/blob/main/docs/pages/relays.md);
 this repo documents the relay side only, not its model catalog.
-One `relay` process exposes N listeners (`BASE_PORT+N`, default `3001`–`3000+N`).
-Each listener forwards through its own MicroWARP client's SOCKS proxy
-(`warp-N:1080`, ~1.8 MiB RAM each) and is reachable two ways:
+One Bun `relay` process exposes N listeners (`BASE_PORT+N`, default `3001`–`3000+N`).
+Each listener uses Bun's native `fetch` and a private loopback HTTP CONNECT
+adapter to reach its own MicroWARP client's SOCKS proxy (`warp-N:1080`,
+~1.8 MiB RAM each). The relay is reachable two ways:
 
 1. **TryCloudflare Quick Tunnels (`--with-tunnels`):** Each relay is exposed as a public HTTPS URL (`https://<hash>.trycloudflare.com`). Zero configuration required—no Cloudflare account, domain, or client-side VPN needed.
 2. **Mesh-VPN Direct (Tailscale):** Static private URLs (`http://<tailscale-ip>:310N`) published directly over an encrypted WireGuard mesh network.
@@ -17,25 +18,28 @@ Each listener forwards through its own MicroWARP client's SOCKS proxy
 ```
 [OMP/Pi via pi-freeflow] ──► https://<hash>.trycloudflare.com (TryCloudflare, public HTTPS)
                           └─► http://<tailscale-ip>:310N      (Mesh-VPN, static private)
-      ──► [relay :300N] ──► [MicroWARP SOCKS :1080] ──► [upstream API, egress <EGRESS-IP>]
+      ──► [relay :300N (Bun)] ──► [loopback HTTP CONNECT] ──► [MicroWARP SOCKS :1080] ──► [upstream API, egress <EGRESS-IP>]
 ```
 
 ## Request lifecycle
 
 1. Client sends the request to the relay URL with two headers
    (`server.mjs`: `x-relay-target`, `x-relay-path`).
-2. Relay strips those headers (plus `host`), forwards
-   `method + headers + body` to `target + relayPath` via that relay's
-   own `ProxyAgent` dispatcher (`undici`), 5-minute cap
-   (`AbortSignal.timeout(300000)`), client-disconnect abort wiring.
+2. Relay strips those headers (plus `host`), hands
+   `method + headers + body` to Bun's native `fetch`, 5-minute cap
+   (`AbortSignal.timeout(300000)`), client-disconnect abort wiring. Bun dials
+   the relay's private loopback HTTP CONNECT adapter, which validates the
+   authority again and opens the lane's SOCKS5 tunnel. The adapter speaks the
+   absolute-form HTTP dialect for plain-HTTP upstreams (tests) and CONNECT for
+   HTTPS, so upstream DNS resolution stays inside WARP.
 3. Relay answers with `cache-control: no-cache`,
    `x-accel-buffering: no`, upstream `content-type` only, `flushHeaders()`
    before the first body byte, then `pipeline(Readable.fromWeb(body), res)`
    — SSE tokens stream, nothing buffers. See `server.mjs`.
 4. No `x-relay-target` header = health check: relay fetches
-   `https://cloudflare.com/cdn-cgi/trace` through its own dispatcher and
-   returns `Relay #N OK (via socks5://warp-N:1080)` plus the trace body.
-   A per-relay egress proof, not a load-balancer ping.
+   `https://cloudflare.com/cdn-cgi/trace` through the same loopback adapter and
+   returns `Relay #N OK (via WARP)` plus the trace body. A per-relay egress
+   proof, not a load-balancer ping.
 5. Target not in the allowlist (`RELAY_ALLOWED_TARGETS`, default
    `https://opencode.ai`, `https://api.kilo.ai`) = `403 {"error":"Forbidden target"}`.
    The allowlist covers every hop: upstream `3xx` redirects are refused

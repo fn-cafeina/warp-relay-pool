@@ -30,13 +30,13 @@ versions or benchmarks.
 Run before opening a PR:
 
 ```sh
+bun --version          # tests spawn the relay; CI pins Bun 1.4.3
 node --check server.mjs
 node --check keep-cold.mjs
 for f in generate-compose.sh setup.sh get-status.sh logwatch.sh \
          logwatch.test.sh warp-lite/entrypoint.sh; do
   sh -n "$f"          # `sh -n a b c` would parse only the first file
 done
-npm ci --no-audit --no-fund
 bash logwatch.test.sh
 node --test test/*.test.mjs
 sh ./generate-compose.sh 10
@@ -45,8 +45,9 @@ docker compose config -q
 ```
 
 CI (`.github/workflows/ci.yml`) runs the same gates plus ShellCheck, a
-`warp-lite` image build, and a gitleaks scan. Commit `package-lock.json`
-whenever `package.json` changes — CI uses `npm ci`.
+`warp-lite` image build, a relay image build, and a gitleaks scan. The relay
+has no npm dependencies; Bun comes from the pinned `oven/bun` image and
+`setup-bun` in CI.
 
 ## Style
 

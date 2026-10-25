@@ -1,10 +1,12 @@
 # 02 — Deploy
 
 Runs on a Docker Linux host (needs `NET_ADMIN` for WARP; not Windows).
-Prereqs: `docker compose`, `node >= 18` for `keep-cold.mjs` (the test suite
-and the relay image use Node 22), and systemd for the timers. For mesh-VPN ingress, the host must already be joined to
-your tailnet. `setup.sh` may install Docker and Node itself; if the invoking
-user is not yet in the `docker` group, the wizard re-executes under `sudo`.
+Prereqs: `docker compose`, `node >= 18` for `keep-cold.mjs`, and systemd for
+the timers. The test suite runs on Node 22; the relay image is pinned to Bun
+`1.4.3` and needs no host Bun install. For mesh-VPN ingress, the host must
+already be joined to your tailnet. `setup.sh` may install Docker and Node
+itself; if the invoking user is not yet in the `docker` group, the wizard
+re-executes under `sudo`.
 
 ## Quickest: Automated Setup Wizard
 
@@ -136,7 +138,9 @@ CI: `bash logwatch.test.sh`.
 ## Rebuild, don't restart
 
 The relay image is `COPY`-baked (`Dockerfile` copies `server.mjs` at build
-time). After editing `server.mjs`:
+time) and runs on the pinned `oven/bun:1.4.3-alpine` base. The entrypoint
+refuses to start under Node: Bun's native `fetch` is the upstream transport,
+not an optional runtime. After editing `server.mjs`:
 
 ```bash
 docker compose build relay && docker compose up -d relay

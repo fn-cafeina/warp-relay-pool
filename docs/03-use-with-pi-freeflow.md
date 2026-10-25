@@ -54,7 +54,7 @@ No `x-relay-target` header = relay answers directly through its own WARP
 client. Per-relay, via the bridge (from the Docker host):
 
 ```bash
-curl -s http://10.244.0.100:3001/          # Relay #1 OK + cdn-cgi/trace body
+curl -s http://10.244.0.100:3001/          # Relay #1 OK (via WARP) + cdn-cgi/trace body
 ```
 
 Via the mesh address (same path the client uses):

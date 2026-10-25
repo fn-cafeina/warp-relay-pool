@@ -6,8 +6,8 @@ request on each daily model, then continuously rotates any relay that answers
 HTTP 429 until it streams 200 again. Your public tunnel URLs never change —
 only the underlying WARP egress container is restarted.
 
-**Naming:** `server.mjs` is the relay router (the HTTPS reverse-proxy);
-`keep-cold.mjs` is the rotation controller/prober.
+**Naming:** `server.mjs` is the Bun relay router (the HTTPS reverse-proxy);
+`keep-cold.mjs` is the Node rotation controller/prober.
 
 ## Default behaviour (timer / `--sweep`)
 
@@ -92,7 +92,10 @@ still throttled after the attempt budget, `2` on usage/configuration error.
 ### Read-only status probe (`--probe`)
 
 Evaluates every relay against the target model using the exact production client
-fingerprint without performing any docker restarts or mutating state files:
+fingerprint without performing any docker restarts or mutating state files.
+That fingerprint includes the complete `<env>` block with `Working directory:`
+and OpenCode's timestamp-derived session ID; the gate answers 429 when either
+is missing, even through a clean WARP egress:
 
 ```bash
 node keep-cold.mjs --probe

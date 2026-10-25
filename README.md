@@ -11,8 +11,8 @@ Provides N isolated Cloudflare WARP egress addresses paired with public HTTPS UR
           └── Tailscale (Private Mesh-VPN direct)           ──► http://<tailscale-ip>:310N
                     │
                     ▼
-          [relay router :300N (10.244.0.100)]
-                    │  (per-port SOCKS5 forward)
+          [relay router :300N (Bun native fetch)]
+                    │  (loopback HTTP CONNECT -> per-relay SOCKS5)
                     ▼
           [MicroWARP SOCKS :1080 (Docker bridge 10.244.0.0/16)]
                     │  (Alpine WireGuard + microsocks, ~1.8 MiB RAM/node)
@@ -36,6 +36,8 @@ Or run non-interactively with auto-detected sizing recommendations:
 ```bash
 ./setup.sh -y
 ```
+
+The relay image itself runs Bun `1.4.3` with its native `fetch`; Node.js 18+ is only needed on the host for the `keep-cold` prober. No host Bun install is required when using Docker.
 
 ### What the Setup Wizard Does:
 1. **Prerequisite Check & Auto-Install:** Verifies and automatically installs Docker, Docker Compose, and Node.js 18+ (for the prober) if missing.
@@ -98,6 +100,7 @@ Even when exposed over public TryCloudflare HTTPS URLs, the relay is strictly pr
 - **Strict Target Allowlist:** The relay router (`server.mjs`) strictly enforces `RELAY_ALLOWED_TARGETS` (`https://opencode.ai`, `https://api.kilo.ai` by default).
 - Requests to any other origin (or malicious targets) return **HTTP 403 Forbidden** immediately.
 - Only inference streaming requests conforming to the `x-relay-target` protocol are forwarded.
+- **Two-layer egress gate:** Bun's native fetch dials a private loopback HTTP CONNECT adapter, which re-checks the target authority before opening the lane's SOCKS5 tunnel. A bug in the header allowlist cannot turn the relay into an open proxy.
 
 ---
 
@@ -147,10 +150,10 @@ node keep-cold.mjs --once
 | File | Role |
 | ---- | ---- |
 | `setup.sh` | Interactive and non-interactive auto-setup wizard with VPS hardware sizing |
-| `server.mjs` | Relay router: allowlist proxy, one listener per `300N`, SSE/no-buffer streaming |
+| `server.mjs` | Bun relay router: native fetch, loopback CONNECT adapter, allowlist, one listener per `300N`, SSE streaming |
 | `keep-cold.mjs` | Two-tier 429 prober / rotator for MicroWARP backends (`--once` or `--loop`) |
 | `docker-compose.yml` | N × MicroWARP + relay app; tunnels appended only by `--with-tunnels` |
-| `Dockerfile` / `package.json` | Relay image (COPY-baked) / dependencies |
+| `Dockerfile` / `package.json` | Bun relay image (COPY-baked) / scripts; no runtime npm dependencies |
 | `generate-compose.sh` | Regenerate `docker-compose.yml`: `[count] [--with-tunnels] [--legacy-warp]` |
 | `get-status.sh` | Status script: prints public tunnel URLs, egress IPs, client commands |
 | `systemd/` | systemd service units and timers for keep-cold and logwatch |

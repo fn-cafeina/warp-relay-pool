@@ -37,6 +37,12 @@ upstream quota (`GLOBAL_QUOTA_GUARD`), no rotation helps.
 `docker compose restart relay` re-runs old code. Always
 `docker compose build relay && docker compose up -d relay`.
 
+**`Bun runtime required` on startup.** The relay must run on Bun; Node exits
+deliberately. Use `bun server.mjs` for a host-side run (Bun `1.4.3` is the
+pinned image version) or rebuild the Docker image, which starts it correctly.
+`docker compose logs relay` will show the same line if an old unit or wrapper
+invokes `node`.
+
 **Containers not ready / `(not ready)`.** WARP clients
 need a minute to handshake after `up` or rotation. Check per layer:
 `docker logs warp-relay-warp-N` (client state), in tunnels mode `docker logs

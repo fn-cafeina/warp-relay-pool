@@ -463,27 +463,52 @@ function shortReason(e) {
 }
 
 // ── Upstream fingerprint ────────────────────────────────────────────
-// Historically OpenCode's free tier rejected requests that did not look like
-// the official client, so the probe carried the same headers and tool
-// declarations the proxy sends — a 403 would have hidden the 429 we are
-// looking for. Since 2026-10-14 that tier refuses every non-OpenCode client
-// regardless of shape (403 FreeTierError), so the defaults target the Kilo
-// lane, where these headers are ignored but harmless; the fingerprint is
-// kept for pools still pointed at opencode.ai via PROBE_TARGET.
+// OpenCode's free tier validates the official client fingerprint. The probe
+// carries the same headers, tool declarations, <env> block and timestamp
+// session the proxy sends; without them a clean egress can still answer 429
+// (or 403 FreeTierError), hiding the throttle state we are looking for. Pools
+// pointed at another OpenAI-compatible lane via PROBE_TARGET ignore the headers
+// but find them harmless.
 const OPENCODE_CLIENT = "cli";
 const OPENCODE_PROJECT = createHash("sha1")
  .update("git-remote:github.com/anomalyco/opencode")
  .digest("hex");
 const ID_CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+let sessionTimestamp = 0;
+let sessionCounter = 0;
 
-/** `ses_` + 12 hex + 14 alphanumeric, the shape the upstream gate validates. */
-function sessionId() {
- const hex = randomBytes(6).toString("hex");
- let rest = "";
+/**
+ * `ses_` + 12 hex + 14 alphanumeric, matching OpenCode's identifier algorithm.
+ *
+ * The gate validates more than the shape: the 12 hex characters encode an
+ * inverted (descending) millisecond timestamp. A random prefix has the right
+ * length and character class but is rejected as a non-OpenCode client, so the
+ * probe must generate the real value, not a plausible-looking one.
+ */
+function sessionId(timestamp = Date.now()) {
+ if (timestamp !== sessionTimestamp) {
+  sessionTimestamp = timestamp;
+  sessionCounter = 0;
+ }
+ sessionCounter++;
+ const current = BigInt(timestamp) * 0x1000n + BigInt(sessionCounter);
+ const value = ~current;
+ const hex = Array.from({ length: 6 }, (_, index) =>
+  Number((value >> BigInt(40 - 8 * index)) & 0xffn)
+   .toString(16)
+   .padStart(2, "0"),
+ ).join("");
  const bytes = randomBytes(14);
+ let rest = "";
  for (let i = 0; i < 14; i++) rest += ID_CHARS[bytes[i] % ID_CHARS.length];
  return `ses_${hex}${rest}`;
 }
+
+// Upstream's free-tier gate also requires a complete <env> pair carrying
+// `Working directory:`. Without it the same request answers 429 even through
+// a clean egress, so probe bodies carry it on both wire shapes.
+const FALLBACK_WORKING_DIRECTORY = "(current project)";
+const ENV_BLOCK = `<env>\n  Working directory: ${FALLBACK_WORKING_DIRECTORY}\n</env>`;
 
 const FINGERPRINT_TOOLS = ["bash", "glob", "grep", "read", "edit", "write"];
 // Chat Completions placeholder shape: { type, function: { name, ... } }.
@@ -507,6 +532,7 @@ function buildProbe(model) {
    body: JSON.stringify({
     model,
     input: "ping",
+    instructions: ENV_BLOCK,
     stream: true,
     tools: RESPONSE_PLACEHOLDER_TOOLS,
    }),
@@ -518,7 +544,10 @@ function buildProbe(model) {
    model,
    stream: true,
    max_tokens: 4,
-   messages: [{ role: "user", content: "ping" }],
+   messages: [
+    { role: "system", content: ENV_BLOCK },
+    { role: "user", content: "ping" },
+   ],
    tools: PLACEHOLDER_TOOLS,
   }),
  };

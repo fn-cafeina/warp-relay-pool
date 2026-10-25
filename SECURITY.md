@@ -14,6 +14,12 @@ the security model, the repository privacy rules, and how to report issues.
 request is always `<allowlisted-target>` + `x-relay-path`, so the relay can
 only ever reach allowlisted hosts — it is not a general-purpose open proxy.
 
+**Two-layer egress gate.** The relay's Bun native fetch dials a private
+loopback HTTP CONNECT adapter, which re-checks the canonical host and port
+before opening the lane's WARP SOCKS5 tunnel. The adapter accepts the same
+allowlist plus the Cloudflare trace endpoint used by the health check, so a
+bug in the header check cannot silently turn the relay into an open proxy.
+
 **No client authentication.** The relay trusts anyone who can reach a
 listener. Possession of a relay URL is enough to (a) make allowlisted
 upstream requests through that relay's egress IP and (b) read the relay's
