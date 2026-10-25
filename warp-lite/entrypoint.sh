@@ -126,10 +126,21 @@ register_warp() {
     ts="$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")"
     reg_payload="{\"key\":\"${pub_key}\",\"install_id\":\"\",\"tos\":\"${ts}\",\"type\":\"Android\",\"model\":\"PC\",\"locale\":\"en_US\"}"
 
-    reg_res="$(curl -fsSL -m 15 -X POST "https://api.cloudflareclient.com/v0a884/reg" \
-        -H "User-Agent: okhttp/3.12.1" \
-        -H "Content-Type: application/json" \
-        -d "$reg_payload")" || die "failed to register device with Cloudflare API"
+    reg_tries=0
+    reg_res=""
+    while [ "$reg_tries" -lt 5 ]; do
+        reg_tries=$((reg_tries + 1))
+        reg_res="$(curl -fsSL -m 15 -X POST "https://api.cloudflareclient.com/v0a884/reg" \
+            -H "User-Agent: okhttp/3.12.1" \
+            -H "Content-Type: application/json" \
+            -d "$reg_payload" 2>/dev/null || true)"
+        if [ -n "$reg_res" ] && printf '%s' "$reg_res" | grep -q '"id":'; then
+            break
+        fi
+        warn "Cloudflare API registration attempt ${reg_tries}/5 failed (likely rate-limited), retrying in 5s..."
+        sleep 5
+    done
+    [ -n "$reg_res" ] && printf '%s' "$reg_res" | grep -q '"id":' || die "failed to register device with Cloudflare API after 5 attempts"
 
     account_id="$(printf '%s' "$reg_res" | grep -o '"id":"[^"]*"' | head -n 1 | cut -d'"' -f4)"
     token="$(printf '%s' "$reg_res" | grep -o '"token":"[^"]*"' | head -n 1 | cut -d'"' -f4)"
